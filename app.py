@@ -2,6 +2,7 @@
 """
 GES SmartSchedule - AI-Powered Electrical Labor Calendar
 """
+import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -116,14 +117,29 @@ def build_calendar_map(token, mailbox, start_date, end_date):
     return mapping
 
 # ─── GRAPH HELPERS ───────────────────────────────────────────────────
+def _graph_cfg():
+    """Read Graph credentials from env vars (App Service) or secrets.toml (local)."""
+    env = {
+        "app_id":         os.environ.get("GRAPH_APP_ID"),
+        "tenant_id":      os.environ.get("GRAPH_TENANT_ID"),
+        "client_secret":  os.environ.get("GRAPH_CLIENT_SECRET"),
+        "shared_mailbox": os.environ.get("GRAPH_SHARED_MAILBOX"),
+    }
+    if all(env.values()):
+        return env
+    try:
+        return dict(st.secrets["graph"])
+    except Exception:
+        return env
+
 def _graph_secrets_ok():
     try:
-        return bool(st.secrets["graph"]["client_secret"])
+        return bool(_graph_cfg()["client_secret"])
     except Exception:
         return False
 
 def get_graph_token():
-    g = st.secrets["graph"]
+    g = _graph_cfg()
     app = msal.ConfidentialClientApplication(
         client_id=g["app_id"],
         client_credential=g["client_secret"],
@@ -442,7 +458,7 @@ def run_sweep():
     log = []
     try:
         token    = get_graph_token()
-        mailbox  = st.secrets["graph"]["shared_mailbox"]
+        mailbox  = _graph_cfg()["shared_mailbox"]
         drive_id, sp_files = get_sharepoint_files(token)
         state    = _load_sweep_state()
 
@@ -804,7 +820,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
 ```
             """)
         else:
-            g              = st.secrets["graph"]
+            g              = _graph_cfg()
             shared_mailbox = g["shared_mailbox"]
             st.info(f"Pushing to: **{shared_mailbox}**")
 
