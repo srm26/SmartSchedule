@@ -1,0 +1,376 @@
+# ==========================================
+# PIT65 Excel to Shared Mailbox Calendar Event Automation
+# Auth: Certificate-Based App-Only
+# Target: Shared Mailbox Calendar
+# ==========================================
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# Import required modules - install if not present
+$requiredModules = @('PnP.PowerShell','Microsoft.Graph.Calendar','ImportExcel')
+
+$AppId      = "2fafc3de-feac-47cf-b231-f16de70392c3"
+$TenantId   = "286f2b7d-9113-445b-ae51-103e88d4584a"
+$TenantName = "viadcorp.onmicrosoft.com"
+
+$Thumbprint = "56523FF6BE8251B75F55337B7179533C128932CD"
+
+# Shared mailbox where calendar events will be created
+$SharedMailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
+
+# SharePoint site and Excel file path
+$SiteUrl = "https://viadcorp.sharepoint.com/sites/ErinsTestSandbox"
+$ExcelFileRelativePath = "/Shared Documents/Attachments/2025_Electrical_Event_Test.xlsx"
+
+# Local temp file
+$TempFile = Join-Path $env:TEMP "2025_Electrical_Event_Test.xlsx"
+
+# ==========================================
+# REQUIRED MODULE CHECK
+# ==========================================
+
+$RequiredModules = @(
+    "Microsoft.Graph.Authentication",
+    "Microsoft.Graph.Users",
+    "Microsoft.Graph.Calendar",
+    "PnP.PowerShell",
+    "ImportExcel"
+)
+
+foreach ($Module in $RequiredModules)
+{
+    if (-not (Get-Module -ListAvailable -Name $Module))
+    {
+        Write-Host "Module missing: $Module" -ForegroundColor Red
+        Write-Host "Install it using:" -ForegroundColor Yellow
+        Write-Host "Install-Module $Module -Scope AllUsers -Force"
+        throw "Required module missing: $Module"
+    }
+}
+
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module Microsoft.Graph.Users -ErrorAction Stop
+Import-Module Microsoft.Graph.Calendar -ErrorAction Stop
+Import-Module PnP.PowerShell -ErrorAction Stop
+Import-Module ImportExcel -ErrorAction Stop
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+
+function Test-BlankValue {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Value
+    )
+
+    if ($null -eq $Value)
+    {
+        return $true
+    }
+
+    $TextValue = "$Value"
+
+    if ($TextValue.Trim().Length -eq 0)
+    {
+        return $true
+    }
+
+    return $false
+}
+
+function Convert-ExcelDateValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Value
+    )
+
+    # If Excel returns serial number date
+    if (
+        $Value -is [int] -or
+        $Value -is [long] -or
+        $Value -is [double] -or
+        $Value -is [decimal]
+    )
+    {
+        return (Get-Date "1899-12-30").AddDays([double]$Value)
+    }
+
+    # If Excel returns normal date text/date object
+    return Get-Date $Value
+}
+
+# ==========================================
+# START COUNTERS
+# ==========================================
+
+$CreatedCount = 0
+$SkippedCount = 0
+$FailedCount  = 0
+
+# ==========================================
+# CONNECT TO MICROSOFT GRAPH
+# ==========================================
+
+Write-Host ""
+Write-Host "Connecting to Microsoft Graph using certificate..." -ForegroundColor Cyan
+
+try
+{
+    Connect-MgGraph `
+        -TenantId $TenantId `
+        -ClientId $AppId `
+        -CertificateThumbprint $Thumbprint `
+        -NoWelcome `
+        -ErrorAction Stop
+
+    $GraphContext = Get-MgContext
+
+    Write-Host "Connected to Microsoft Graph." -ForegroundColor Green
+    Write-Host "Tenant Id : $($GraphContext.TenantId)" -ForegroundColor Green
+    Write-Host "Client Id : $($GraphContext.ClientId)" -ForegroundColor Green
+    Write-Host "Auth Type : $($GraphContext.AuthType)" -ForegroundColor Green
+}
+catch
+{
+    Write-Host "Failed to connect to Microsoft Graph." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    throw
+}
+
+# ==========================================
+# VERIFY SHARED MAILBOX OBJECT
+# ==========================================
+
+Write-Host ""
+Write-Host "Validating shared mailbox in Graph: $SharedMailbox" -ForegroundColor Cyan
+
+try
+{
+    $MailboxObject = Get-MgUser -UserId $SharedMailbox -ErrorAction Stop
+
+    Write-Host "Shared mailbox object found." -ForegroundColor Green
+    Write-Host "Display Name : $($MailboxObject.DisplayName)" -ForegroundColor Green
+    Write-Host "User Principal Name : $($MailboxObject.UserPrincipalName)" -ForegroundColor Green
+}
+catch
+{
+    Write-Host "Unable to find or access shared mailbox object in Graph." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Check if the shared mailbox exists and is visible to Microsoft Graph." -ForegroundColor Yellow
+    throw
+}
+
+# ==========================================
+# CONNECT TO SHAREPOINT
+# ==========================================
+
+Write-Host ""
+Write-Host "Connecting to SharePoint using certificate..." -ForegroundColor Cyan
+
+try
+{
+    Connect-PnPOnline `
+        -Url $SiteUrl `
+        -ClientId $AppId `
+        -Tenant $TenantName `
+        -Thumbprint $Thumbprint `
+        -ErrorAction Stop
+
+    $Web = Get-PnPWeb -ErrorAction Stop
+
+    Write-Host "Connected to SharePoint." -ForegroundColor Green
+    Write-Host "Site Title : $($Web.Title)" -ForegroundColor Green
+}
+catch
+{
+    Write-Host "Failed to connect to SharePoint." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    throw
+}
+
+# ==========================================
+# DOWNLOAD EXCEL FILE FROM SHAREPOINT
+# ==========================================
+
+Write-Host ""
+Write-Host "Downloading Excel file from SharePoint..." -ForegroundColor Cyan
+
+try
+{
+    if (Test-Path $TempFile)
+    {
+        Remove-Item $TempFile -Force
+    }
+
+    Get-PnPFile `
+        -Url $ExcelFileRelativePath `
+        -Path (Split-Path $TempFile) `
+        -FileName (Split-Path $TempFile -Leaf) `
+        -AsFile `
+        -Force `
+        -ErrorAction Stop
+
+    if (-not (Test-Path $TempFile))
+    {
+        throw "Excel file was not downloaded to temp path."
+    }
+
+    Write-Host "Excel file downloaded successfully." -ForegroundColor Green
+    Write-Host "Local Path : $TempFile" -ForegroundColor Green
+}
+catch
+{
+    Write-Host "Failed to download Excel file." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    throw
+}
+
+# ==========================================
+# READ EXCEL
+# ==========================================
+
+Write-Host ""
+Write-Host "Reading Excel file..." -ForegroundColor Cyan
+
+try
+{
+    $ExcelData = Import-Excel -Path $TempFile -ErrorAction Stop
+
+    if ($null -eq $ExcelData)
+    {
+        throw "No rows found in Excel file."
+    }
+
+    Write-Host "Rows Found : $($ExcelData.Count)" -ForegroundColor Green
+}
+catch
+{
+    Write-Host "Failed to read Excel file." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    throw
+}
+
+# ==========================================
+# PROCESS EACH ROW AND CREATE EVENT
+# ==========================================
+
+foreach ($Show in $ExcelData)
+{
+    $ShowName    = $Show.'Show Name'
+    $InstallDate = $Show.'Install Date'
+    $EndDate     = $Show.'Show Close Date'
+    $Location    = $Show.Facility
+
+    if (
+        (Test-BlankValue $ShowName) -or
+        (Test-BlankValue $InstallDate) -or
+        (Test-BlankValue $EndDate)
+    )
+    {
+        Write-Host ""
+        Write-Host "Skipping row because required data is missing." -ForegroundColor Yellow
+        $SkippedCount++
+        continue
+    }
+
+    try
+    {
+        $StartDateTime = Convert-ExcelDateValue -Value $InstallDate
+        $EndDateTime   = Convert-ExcelDateValue -Value $EndDate
+
+        if ($EndDateTime -lt $StartDateTime)
+        {
+            throw "Show Close Date is earlier than Install Date for show: $ShowName"
+        }
+
+        if (Test-BlankValue $Location)
+        {
+            $Location = "Not specified"
+        }
+
+        Write-Host ""
+        Write-Host "Creating calendar event..." -ForegroundColor Cyan
+        Write-Host "Subject  : $ShowName" -ForegroundColor White
+        Write-Host "Start    : $($StartDateTime.ToString('yyyy-MM-dd'))" -ForegroundColor White
+        Write-Host "End      : $($EndDateTime.ToString('yyyy-MM-dd'))" -ForegroundColor White
+        Write-Host "Location : $Location" -ForegroundColor White
+        Write-Host "Mailbox  : $SharedMailbox" -ForegroundColor White
+
+        $EventBody = @{
+            Subject = "$ShowName"
+            IsAllDay = $true
+            Start = @{
+                DateTime = $StartDateTime.ToString("yyyy-MM-ddT00:00:00")
+                TimeZone = "UTC"
+            }
+            End = @{
+                DateTime = $EndDateTime.AddDays(1).ToString("yyyy-MM-ddT00:00:00")
+                TimeZone = "UTC"
+            }
+            Location = @{
+                DisplayName = "$Location"
+            }
+            Body = @{
+                ContentType = "Text"
+                Content = "Automatically created from SharePoint Excel file: 2025_Electrical_Event_Test.xlsx"
+            }
+        }
+
+        $CreatedEvent = New-MgUserEvent `
+            -UserId $SharedMailbox `
+            -BodyParameter $EventBody `
+            -ErrorAction Stop
+
+        Write-Host "SUCCESS: Event created." -ForegroundColor Green
+        Write-Host "Event ID: $($CreatedEvent.Id)" -ForegroundColor Green
+
+        $CreatedCount++
+    }
+    catch
+    {
+        Write-Host ""
+        Write-Host "FAILED: Event could not be created for: $ShowName" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+
+        if ($_.Exception.Message -match "Access is denied|Forbidden|403|ErrorAccessDenied")
+        {
+            Write-Host ""
+            Write-Host "Permission issue detected." -ForegroundColor Yellow
+            Write-Host "Confirm the App Registration has Microsoft Graph Calendars.ReadWrite as APPLICATION permission and Admin Consent is granted." -ForegroundColor Yellow
+            Write-Host "If permission is already granted, check if an Exchange Application Access Policy is restricting this app from the shared mailbox." -ForegroundColor Yellow
+        }
+
+        $FailedCount++
+    }
+}
+
+# ==========================================
+# CLEANUP
+# ==========================================
+
+Write-Host ""
+Write-Host "Cleaning temporary file..." -ForegroundColor Cyan
+
+if (Test-Path $TempFile)
+{
+    Remove-Item $TempFile -Force
+}
+
+Disconnect-PnPOnline -ErrorAction SilentlyContinue
+Disconnect-MgGraph -ErrorAction SilentlyContinue
+
+# ==========================================
+# SUMMARY
+# ==========================================
+
+Write-Host ""
+Write-Host "=========================================" -ForegroundColor Green
+Write-Host "Script Completed" -ForegroundColor Green
+Write-Host "=========================================" -ForegroundColor Green
+Write-Host "Events Created : $CreatedCount" -ForegroundColor Green
+Write-Host "Rows Skipped   : $SkippedCount" -ForegroundColor Yellow
+Write-Host "Rows Failed    : $FailedCount" -ForegroundColor Red
+Write-Host "=========================================" -ForegroundColor Green
