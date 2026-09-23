@@ -23,33 +23,30 @@ $KEY = az storage account keys list --account-name $STORAGE --resource-group $ST
 # Create zip (exclude secrets, data files, deploy script itself)
 Write-Host "==> Creating deployment zip..." -ForegroundColor Cyan
 if (Test-Path $ZIP) { Remove-Item $ZIP -Force }
-$include = @("app.py","requirements.txt","startup.sh",".gitignore","Event_via_SharedMailbox.txt")
+$include = @("app.py","requirements.txt","startup.sh","GES-logo.webp","Event_via_SharedMailbox.txt")
 $paths = $include | ForEach-Object { Join-Path $PSScriptRoot $_ } | Where-Object { Test-Path $_ }
 Compress-Archive -LiteralPath $paths -DestinationPath $ZIP -Force
 $size = [math]::Round(([System.IO.FileInfo]$ZIP).Length / 1KB)
 Write-Host "  Zip: $size KB" -ForegroundColor Gray
 
+# Ensure container exists
+Write-Host "==> Ensuring blob container exists..." -ForegroundColor Cyan
+az storage container create --name $CONTAINER --account-name $STORAGE --account-key $KEY --output none
+
 # Upload
 Write-Host "==> Uploading to blob storage..." -ForegroundColor Cyan
-az storage blob upload `
-    --account-name $STORAGE --account-key $KEY `
-    --container-name $CONTAINER --name $BLOB `
-    --file $ZIP --overwrite --output none
+az storage blob upload --account-name $STORAGE --account-key $KEY --container-name $CONTAINER --name $BLOB --file $ZIP --overwrite --output none
 
 # Generate SAS URL (1 year expiry)
 Write-Host "==> Generating SAS URL..." -ForegroundColor Cyan
 $EXPIRY = (Get-Date).AddYears(1).ToString("yyyy-MM-dd")
-$SAS_URL = az storage blob generate-sas `
-    --account-name $STORAGE --account-key $KEY `
-    --container-name $CONTAINER --name $BLOB `
-    --permissions r --expiry $EXPIRY `
-    --https-only --full-uri -o tsv
+$SAS_TOKEN = az storage blob generate-sas --account-name $STORAGE --account-key $KEY --container-name $CONTAINER --name $BLOB --permissions r --expiry $EXPIRY --https-only -o tsv
+$SAS_URL = "https://$STORAGE.blob.core.windows.net/$CONTAINER/$BLOB`?$SAS_TOKEN"
+Write-Host "  SAS URL generated." -ForegroundColor Gray
 
 # Set WEBSITE_RUN_FROM_PACKAGE
 Write-Host "==> Setting WEBSITE_RUN_FROM_PACKAGE..." -ForegroundColor Cyan
-az webapp config appsettings set `
-    --name $APP_NAME --resource-group $RG `
-    --settings "WEBSITE_RUN_FROM_PACKAGE=$SAS_URL" --output none
+az webapp config appsettings set --name $APP_NAME --resource-group $RG --settings "WEBSITE_RUN_FROM_PACKAGE=$SAS_URL" --output none
 
 # Restart
 Write-Host "==> Restarting App Service..." -ForegroundColor Cyan

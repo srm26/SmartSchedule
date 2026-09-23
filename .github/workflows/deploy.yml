@@ -1,0 +1,37 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create deployment zip
+        run: zip -j app.zip app.py requirements.txt startup.sh GES-logo.webp Event_via_SharedMailbox.txt
+
+      - name: Set startup command
+        run: |
+          az webapp config set \
+            --name app-wus2-elecsch-dv-01 \
+            --resource-group rg-wus2-elecsch-dv-compute \
+            --startup-file "bash /home/site/wwwroot/startup.sh"
+
+      - name: Deploy zip to App Service
+        run: |
+          az webapp deploy \
+            --name app-wus2-elecsch-dv-01 \
+            --resource-group rg-wus2-elecsch-dv-compute \
+            --src-path app.zip \
+            --type zip \
+            --async true

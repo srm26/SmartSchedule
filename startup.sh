@@ -10,10 +10,10 @@ shared_mailbox = "${GRAPH_SHARED_MAILBOX}"
 EOF
 
 # Install dependencies
-pip install -r /tmp/app/requirements.txt --quiet
+pip install -r /home/site/wwwroot/requirements.txt --quiet
 
 # Start Streamlit
-exec python -m streamlit run /tmp/app/app.py \
+exec python -m streamlit run /home/site/wwwroot/app.py \
     --server.port 8000 \
     --server.address 0.0.0.0 \
     --server.headless true
