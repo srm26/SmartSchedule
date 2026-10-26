@@ -513,7 +513,7 @@ for _k, _v in [("df", None), ("file_name", None), ("notifs", None), ("ai_done", 
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("GES-logo.webp", use_container_width=True)
+    st.image("GES-logo-white.png", use_container_width=True)
     st.markdown("## GES SmartSchedule")
     st.caption("AI-Powered Electrical Labor Calendar")
     st.divider()

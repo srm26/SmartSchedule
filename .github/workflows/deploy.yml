@@ -18,7 +18,7 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Create deployment zip
-        run: zip -j app.zip app.py requirements.txt startup.sh GES-logo.webp Event_via_SharedMailbox.txt
+        run: zip -j app.zip app.py requirements.txt startup.sh GES-logo.webp GES-logo-white.png Event_via_SharedMailbox.txt
 
       - name: Set startup command
         run: |

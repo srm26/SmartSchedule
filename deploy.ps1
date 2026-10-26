@@ -23,7 +23,7 @@ $KEY = az storage account keys list --account-name $STORAGE --resource-group $ST
 # Create zip (exclude secrets, data files, deploy script itself)
 Write-Host "==> Creating deployment zip..." -ForegroundColor Cyan
 if (Test-Path $ZIP) { Remove-Item $ZIP -Force }
-$include = @("app.py","requirements.txt","startup.sh","GES-logo.webp","Event_via_SharedMailbox.txt")
+$include = @("app.py","requirements.txt","startup.sh","GES-logo.webp","GES-logo-white.png","Event_via_SharedMailbox.txt")
 $paths = $include | ForEach-Object { Join-Path $PSScriptRoot $_ } | Where-Object { Test-Path $_ }
 Compress-Archive -LiteralPath $paths -DestinationPath $ZIP -Force
 $size = [math]::Round(([System.IO.FileInfo]$ZIP).Length / 1KB)
