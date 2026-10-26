@@ -46,7 +46,11 @@ Write-Host "  SAS URL generated." -ForegroundColor Gray
 
 # Set WEBSITE_RUN_FROM_PACKAGE
 Write-Host "==> Setting WEBSITE_RUN_FROM_PACKAGE..." -ForegroundColor Cyan
-az webapp config appsettings set --name $APP_NAME --resource-group $RG --settings "WEBSITE_RUN_FROM_PACKAGE=$SAS_URL" --output none
+# Pass via JSON file: az.cmd runs through cmd.exe, which splits the SAS URL on '&'
+$SETTINGS = "$env:TEMP\smartschedule-rfp.json"
+@{ WEBSITE_RUN_FROM_PACKAGE = $SAS_URL } | ConvertTo-Json | Set-Content $SETTINGS
+az webapp config appsettings set --name $APP_NAME --resource-group $RG --settings "@$SETTINGS" --output none
+Remove-Item $SETTINGS
 
 # Restart
 Write-Host "==> Restarting App Service..." -ForegroundColor Cyan
