@@ -33,6 +33,10 @@ st.markdown("""
   [data-testid="stSidebar"] { background: #1a1f36; }
   [data-testid="stSidebar"] * { color: #e2e8f0 !important; }
   [data-testid="stSidebar"] input { color: #1e293b !important; }
+  [data-testid="stSidebar"] [data-testid="stBaseButton-secondary"] {
+    background: #2d3452; border: 1px solid #64748b; }
+  [data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]:hover {
+    background: #3b4470; border-color: #e2e8f0; }
   [data-testid="stSidebar"] .stRadio label { font-size: 15px; padding: 6px 0; }
   .metric-card {
     background:#fff; border:1px solid #e2e8f0; border-radius:12px;
