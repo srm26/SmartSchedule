@@ -542,6 +542,9 @@ if _graph_secrets_ok():
 for _k, _v in [("df", None), ("file_name", None), ("notifs", None), ("ai_done", False)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
+# Re-assign every run so the nav radio keeps its page while hidden during Change File
+# (otherwise Streamlit drops its value and the server falls out of sync with the browser).
+st.session_state.nav = st.session_state.get("nav", "Dashboard")
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────
 with st.sidebar:
@@ -565,7 +568,7 @@ with st.sidebar:
         page = st.radio(
             "Navigation",
             ["Dashboard", "Schedule & Push", "Calendar View", "Crew Lookup"],
-            label_visibility="collapsed",
+            key="nav", label_visibility="collapsed",
         )
     else:
         st.warning("No file loaded")
