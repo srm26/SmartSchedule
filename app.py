@@ -76,7 +76,7 @@ LV_CREW_COLS    = [1, 2, 3, 4, 5, 6, 7]   # numeric header columns for crew slot
 # Outlook is the source of truth — no local file needed.
 
 def _field_hash(row):
-    key = "|".join(str(row.get(f, "")) for f in ["SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"])
+    key = "|".join(str(row.get(f, "")) for f in ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"])
     return hashlib.md5(key.encode()).hexdigest()[:8]
 
 def _make_body(notes, event_id, field_hash):
@@ -308,7 +308,10 @@ def parse_lv_byDay(uploaded_file, sheet_name):
                 crew_list.append(val)
 
         fn = str(r.get("FUNCTION", "") or "").strip().upper() or "SHOW"
-        raw_id = str(r.get("ID", "") or "").strip()
+        id_val = r.get("ID", "")
+        if isinstance(id_val, float) and id_val.is_integer():
+            id_val = int(id_val)  # Excel numbers come in as 1.0 — store as "1"
+        raw_id = str(id_val or "").strip()
         event_id = raw_id if raw_id and raw_id.lower() not in ("nan", "none") else _make_event_id(show, fn, date)
         rows.append({
             "EVENT_ID":      event_id,
@@ -400,8 +403,26 @@ def _load_sweep_state():
 def _save_sweep_state(s):
     SWEEP_STATE_FILE.write_text(json.dumps(s, indent=2))
 
-def _sync_dataframe(token, mailbox, df_file):
-    """Run create/update/delete sync for one parsed dataframe. Returns stats dict."""
+def _load_folder(token):
+    """Download and parse every LV-format file in the SharePoint folder.
+    Files without a 'By Day' sheet are not schedules and are ignored.
+    Returns (sp_files, {name: df}, {name: error})."""
+    drive_id, sp_files = get_sharepoint_files(token)
+    parsed, errors = {}, {}
+    for f in sp_files:
+        try:
+            raw = download_sharepoint_file(token, drive_id, f["id"])
+            if LV_SHEET not in pd.ExcelFile(io.BytesIO(raw)).sheet_names:
+                continue
+            parsed[f["name"]] = parse_lv_byDay(io.BytesIO(raw), LV_SHEET)
+        except Exception as e:
+            errors[f["name"]] = str(e)
+    return sp_files, parsed, errors
+
+def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
+    """Run create/update sync for one parsed dataframe. Returns stats dict.
+    Deletes Outlook events in the date range whose ID is not in keep_ids;
+    pass keep_ids=None to skip deletes (test mode)."""
     cal_map = build_calendar_map(token, mailbox, df_file["DATE"].min(), df_file["DATE"].max())
     created = updated = deleted = skipped = failed = 0
     for _, row in df_file.iterrows():
@@ -440,12 +461,12 @@ def _sync_dataframe(token, mailbox, df_file):
         except Exception:
             failed += 1
 
-    excel_ids = set(df_file["EVENT_ID"])
-    for eid, entry in cal_map.items():
-        if eid not in excel_ids:
-            dresp = delete_graph_event(token, mailbox, entry["graph_id"])
-            if dresp.status_code in (200, 204):
-                deleted += 1
+    if keep_ids is not None:
+        for eid, entry in cal_map.items():
+            if eid not in keep_ids:
+                dresp = delete_graph_event(token, mailbox, entry["graph_id"])
+                if dresp.status_code in (200, 204):
+                    deleted += 1
 
     return {"created": created, "updated": updated, "deleted": deleted,
             "skipped": skipped, "failed": failed}
@@ -459,23 +480,33 @@ def run_sweep():
     try:
         token    = get_graph_token()
         mailbox  = _graph_cfg()["shared_mailbox"]
-        drive_id, sp_files = get_sharepoint_files(token)
+        sp_files, parsed, errors = _load_folder(token)
         state    = _load_sweep_state()
+        limit    = config.get("test_rows", 0)
+
+        # IDs from every file in the folder, so one file never deletes another's events.
+        # If any file failed to parse, skip deletes rather than risk removing its events.
+        keep_ids = None
+        if limit == 0 and not errors:
+            keep_ids = set().union(*(set(d["EVENT_ID"]) for d in parsed.values()))
+        elif limit == 0:
+            log.append("⚠️ Deletes skipped — could not read: " + ", ".join(errors))
 
         for f in sp_files:
             fname    = f["name"]
             last_mod = f["modified"]
             if state.get(fname, {}).get("last_modified") == last_mod:
                 continue  # unchanged — skip
+            if fname in errors:
+                log.append(f"❌ {fname} — Error: {errors[fname]}")
+                continue
+            if fname not in parsed:
+                continue  # not an LV schedule file
             try:
-                raw    = download_sharepoint_file(token, drive_id, f["id"])
-                xl     = pd.ExcelFile(io.BytesIO(raw))
-                sheet  = LV_SHEET if LV_SHEET in xl.sheet_names else xl.sheet_names[0]
-                df_f   = parse_lv_byDay(io.BytesIO(raw), sheet)
-                limit  = config.get("test_rows", 0)
+                df_f   = parsed[fname]
                 if limit > 0:
                     df_f = df_f.head(limit)
-                stats  = _sync_dataframe(token, mailbox, df_f)
+                stats  = _sync_dataframe(token, mailbox, df_f, keep_ids)
                 result = (f"Created:{stats['created']} Updated:{stats['updated']} "
                           f"Deleted:{stats['deleted']} Skipped:{stats['skipped']} Failed:{stats['failed']}")
                 state[fname] = {"last_modified": last_mod,
@@ -936,8 +967,22 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                     bar.progress((i + 1) / len(df_push))
 
                 # Delete Outlook events whose ID is no longer in the full Excel
+                # Keep IDs from the other SharePoint files so this file doesn't delete their events.
+                del_ok = False
                 if not test_mode:
                     excel_ids = set(df["EVENT_ID"])
+                    try:
+                        _, others, errs = _load_folder(token)
+                        if errs:
+                            st.warning("Deletes skipped — could not read: " + ", ".join(errs))
+                        else:
+                            for name, d in others.items():
+                                if name != st.session_state.file_name:
+                                    excel_ids |= set(d["EVENT_ID"])
+                            del_ok = True
+                    except Exception as e:
+                        st.warning(f"Deletes skipped — could not read SharePoint folder: {e}")
+                if del_ok:
                     for eid, entry in cal_map.items():
                         if eid not in excel_ids:
                             stat.text(f"Deleting removed event: {eid}...")
