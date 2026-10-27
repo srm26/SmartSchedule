@@ -11,7 +11,6 @@ import re
 import io
 import json
 import hashlib
-import threading
 from pathlib import Path
 from datetime import datetime as dt
 from zoneinfo import ZoneInfo
@@ -383,8 +382,6 @@ def _build_ics(df_shifts, cal_name):
 
 # ─── AUTO-SWEEP ENGINE ───────────────────────────────────────────────
 SWEEP_STATE_FILE = Path(".streamlit/sweep_state.json")
-_sched      = None
-_sched_lock = threading.Lock()
 
 @st.cache_resource
 def _get_sweep_status():
@@ -525,14 +522,14 @@ def run_sweep():
         status["running"]    = False
         status["log"]        = log
 
+@st.cache_resource
 def _ensure_scheduler():
-    global _sched
-    with _sched_lock:
-        if _sched is None or not _sched.running:
-            _sched = BackgroundScheduler(timezone="UTC")
-            _sched.add_job(run_sweep, "interval", minutes=15,
-                           id="sp_sweep", next_run_time=dt.utcnow())
-            _sched.start()
+    # Streamlit re-runs this script on every click; cache_resource keeps one scheduler per server process.
+    sched = BackgroundScheduler(timezone="UTC")
+    sched.add_job(run_sweep, "interval", minutes=15,
+                  id="sp_sweep", next_run_time=dt.utcnow())
+    sched.start()
+    return sched
 
 if _graph_secrets_ok():
     _ensure_scheduler()
