@@ -254,7 +254,8 @@ def get_sharepoint_files(token):
     return drive_id, [
         {"name": i["name"], "id": i["id"],
          "modified":         i.get("lastModifiedDateTime", ""),        # full ISO for change detection
-         "modified_display": i.get("lastModifiedDateTime", "")[:16].replace("T", " ")}  # for UI
+         "modified_display": dt.fromisoformat(i["lastModifiedDateTime"].replace("Z", "+00:00"))
+                               .astimezone(_PT).strftime("%Y-%m-%d %H:%M PT")}  # for UI
         for i in children.json().get("value", [])
         if i.get("name", "").endswith(".xlsx") and "file" in i
     ]
@@ -385,7 +386,9 @@ def _build_ics(df_shifts, cal_name):
     return "\r\n".join(lines).encode()
 
 # ─── AUTO-SWEEP ENGINE ───────────────────────────────────────────────
-SWEEP_STATE_FILE = Path(".streamlit/sweep_state.json")
+# On App Service the app folder is a read-only package; /home is writable and survives restarts.
+SWEEP_STATE_FILE = (Path("/home/data/sweep_state.json") if os.environ.get("WEBSITE_SITE_NAME")
+                    else Path(".streamlit/sweep_state.json"))
 
 @st.cache_resource
 def _get_sweep_status():
@@ -402,6 +405,7 @@ def _load_sweep_state():
         return {}
 
 def _save_sweep_state(s):
+    SWEEP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     SWEEP_STATE_FILE.write_text(json.dumps(s, indent=2))
 
 def _load_folder(token):
