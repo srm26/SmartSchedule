@@ -158,14 +158,14 @@ def _make_event_id(show, function, date):
     return f"{slug}-{function}-{date.strftime('%Y%m%d')}"
 
 def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
-                      location="", notes="", time_str="", event_id="", field_hash=""):
+                      location="", notes="", time_str="", event_id="", field_hash="", subject=""):
     url     = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events/{graph_id}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     t_start, t_end = _parse_time_range(time_str)
     body_text = _make_body(notes, event_id, field_hash)
     if t_start and t_end:
         payload = {
-            "isAllDay": False,
+            "subject": subject, "isAllDay": False,
             "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": "Pacific Standard Time"},
             "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),     "timeZone": "Pacific Standard Time"},
             "location": {"displayName": location or "Not specified"},
@@ -173,7 +173,7 @@ def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
         }
     else:
         payload = {
-            "isAllDay": True,
+            "subject": subject, "isAllDay": True,
             "start": {"dateTime": start_dt.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
             "end":   {"dateTime": (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
             "location": {"displayName": location or "Not specified"},
@@ -444,7 +444,8 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                 resp = patch_graph_event(token, mailbox, entry["graph_id"],
                                          row["DATE"], pd.Timestamp(end_dt),
                                          row["LOCATION"], notes,
-                                         time_str=row["TIME"], event_id=eid, field_hash=fhash)
+                                         time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                         subject=subject)
                 if resp.status_code == 200:
                     updated += 1
                 elif resp.status_code == 404:
@@ -933,6 +934,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                subject=subject,
                             )
                             if resp.status_code == 200:
                                 updated += 1
