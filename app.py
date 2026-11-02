@@ -147,6 +147,19 @@ def _graph_cfg():
     except Exception:
         return env
 
+def _mailbox_for(branch):
+    """Shared mailbox for a branch, from GRAPH_BRANCH_MAILBOXES ('LV=a@x.com; ORL=b@x.com',
+    app setting or secrets.toml branch_mailboxes). Unlisted branches use the default shared mailbox."""
+    raw = os.environ.get("GRAPH_BRANCH_MAILBOXES")
+    if raw is None:
+        raw = _graph_cfg().get("branch_mailboxes", "")
+    mapping = {}
+    for pair in str(raw).split(";"):
+        if "=" in pair:
+            b, mbx = pair.split("=", 1)
+            mapping[b.strip().upper()] = mbx.strip()
+    return mapping.get(str(branch or "").upper()) or _graph_cfg()["shared_mailbox"]
+
 def _graph_secrets_ok():
     try:
         return bool(_graph_cfg()["client_secret"])
@@ -380,6 +393,7 @@ def parse_lv_byDay(uploaded_file, sheet_name):
             "SCHEDULE_TYPE": "shifts",
             "TIME_ZONE":     branch_tz.get(branch, DEFAULT_TZ),
             "LINK":          _cell_text(r.get(LINK_COL)),
+            "BRANCH":        branch,
         })
 
     if not rows:
@@ -538,7 +552,6 @@ def run_sweep():
     log = []
     try:
         token    = get_graph_token()
-        mailbox  = _graph_cfg()["shared_mailbox"]
         sp_files, parsed, errors = _load_folder(token)
         state    = _load_sweep_state()
         limit    = config.get("test_rows", 0)
@@ -565,7 +578,11 @@ def run_sweep():
                 df_f   = parsed[fname]
                 if limit > 0:
                     df_f = df_f.head(limit)
-                stats  = _sync_dataframe(token, mailbox, df_f, keep_ids)
+                # Each branch's rows go to that branch's shared mailbox
+                stats  = {"created": 0, "updated": 0, "deleted": 0, "skipped": 0, "failed": 0}
+                for mbx, grp in df_f.groupby(df_f["BRANCH"].map(_mailbox_for)):
+                    for k, v in _sync_dataframe(token, mbx, grp, keep_ids).items():
+                        stats[k] += v
                 result = (f"Created:{stats['created']} Updated:{stats['updated']} "
                           f"Deleted:{stats['deleted']} Skipped:{stats['skipped']} Failed:{stats['failed']}")
                 state[fname] = {"last_modified": last_mod,
@@ -915,7 +932,9 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
         else:
             g              = _graph_cfg()
             shared_mailbox = g["shared_mailbox"]
-            st.info(f"Pushing to: **{shared_mailbox}**")
+            # Each branch (ID prefix) pushes to its own shared mailbox; unlisted branches use the default
+            mbx_of = {b: _mailbox_for(b) for b in df["BRANCH"].unique()}
+            st.info("Pushing to: " + ", ".join(f"**{b or 'no prefix'}** → {m}" for b, m in mbx_of.items()))
 
             col_test, _ = st.columns([1, 3])
             with col_test:
@@ -963,10 +982,8 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                 stat = st.empty()
 
                 stat.text("Reading shared calendar from Outlook...")
-                cal_map = build_calendar_map(
-                    token, shared_mailbox,
-                    df["DATE"].min(), df["DATE"].max(),
-                )
+                cal_maps = {m: build_calendar_map(token, m, df["DATE"].min(), df["DATE"].max())
+                            for m in set(mbx_of.values())}
 
                 bar = st.progress(0)
                 for i, (_, row) in enumerate(df_push.iterrows()):
@@ -975,6 +992,8 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                     end_dt  = row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"]
                     notes   = _event_notes(row)
                     fhash   = _field_hash(row)
+                    mbx     = mbx_of[row["BRANCH"]]
+                    cal_map = cal_maps[mbx]
                     stat.text(f"Processing {i+1}/{len(df_push)}: {str(row['SHOW'])[:60]}...")
                     try:
                         entry = cal_map.get(eid)
@@ -983,7 +1002,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                             results.append({"ID": eid, "Event": row["SHOW"], "Status": "Skipped (no change)"})
                         elif entry:
                             resp = patch_graph_event(
-                                token, shared_mailbox, entry["graph_id"],
+                                token, mbx, entry["graph_id"],
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
@@ -995,7 +1014,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 results.append({"ID": eid, "Event": row["SHOW"], "Status": "Updated"})
                             elif resp.status_code == 404:
                                 resp2 = create_graph_event(
-                                    token, shared_mailbox, subject,
+                                    token, mbx, subject,
                                     row["DATE"], pd.Timestamp(end_dt),
                                     row["LOCATION"], notes,
                                     time_str=row["TIME"], event_id=eid, field_hash=fhash,
@@ -1014,7 +1033,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Failed: {msg}"})
                         else:
                             resp = create_graph_event(
-                                token, shared_mailbox, subject,
+                                token, mbx, subject,
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
@@ -1049,11 +1068,11 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                     except Exception as e:
                         st.warning(f"Deletes skipped — could not read SharePoint folder: {e}")
                 if del_ok:
-                    for eid, entry in cal_map.items():
+                    for eid, mbx, entry in ((e, m, x) for m, cm in cal_maps.items() for e, x in cm.items()):
                         if eid not in excel_ids:
                             stat.text(f"Deleting removed event: {eid}...")
                             try:
-                                dresp = delete_graph_event(token, shared_mailbox, entry["graph_id"])
+                                dresp = delete_graph_event(token, mbx, entry["graph_id"])
                                 if dresp.status_code in (204, 200):
                                     deleted += 1
                                     results.append({"ID": eid, "Event": "—", "Status": "Deleted (removed from Excel)"})
