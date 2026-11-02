@@ -75,6 +75,7 @@ LV_SHEET        = "By Day"
 LV_CREW_COLS    = [1, 2, 3, 4, 5, 6, 7]   # numeric header columns for crew slots
 LISTS_SHEET     = "Lists"                  # holds the BRANCH / STATE / TIME ZONE lookup
 DEFAULT_TZ      = "Pacific Standard Time"  # used when a row's branch has no lookup entry (e.g. legacy LV IDs)
+LINK_COL        = "SHAREPOINT LINK"        # optional By Day column; shown on the Outlook event notes
 
 # ─── OUTLOOK BODY MARKERS ────────────────────────────────────────────
 # EVENT_ID and field hash are stored in the first line of the event body.
@@ -82,7 +83,16 @@ DEFAULT_TZ      = "Pacific Standard Time"  # used when a row's branch has no loo
 
 def _field_hash(row):
     key = "|".join(str(row.get(f, "")) for f in ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"])
+    if row.get("LINK"):  # only when present, so rows without a link keep their existing hash
+        key += "|" + str(row["LINK"])
     return hashlib.md5(key.encode()).hexdigest()[:8]
+
+def _event_notes(row):
+    """Outlook notes text: foreman, the NOTES column, and the SharePoint link on its own line."""
+    notes = f"Foreman: {row['FOREMAN']}. {row['NOTES']}".strip()
+    if row.get("LINK"):
+        notes += f"\nSharePoint: {row['LINK']}"
+    return notes
 
 def _make_body(notes, event_id, field_hash):
     marker = f"GES_ID:{event_id}|GES_HASH:{field_hash}"
@@ -292,6 +302,11 @@ def _read_branch_time_zones(xl):
     pairs = lists[["BRANCH", "TIME ZONE"]].dropna()
     return {b.strip().upper(): tz.strip() for b, tz in pairs.itertuples(index=False) if b.strip() and tz.strip()}
 
+def _cell_text(val):
+    """Cell value as stripped text; empty cells (NaN/None) become '' instead of 'nan'."""
+    s = str(val if val is not None else "").strip()
+    return "" if s.lower() in ("nan", "none") else s
+
 def parse_lv_byDay(uploaded_file, sheet_name):
     """Parse the 'By Day' sheet from the LV GES Electrical Show Schedule format.
 
@@ -359,11 +374,12 @@ def parse_lv_byDay(uploaded_file, sheet_name):
             "LOCATION":      str(r.get("LOCATION", "") or "").strip(),
             "TIME":          str(r.get("TIME", "") or "").strip(),
             "FOREMAN":       foreman,
-            "NOTES":         str(r.get("NOTES", "") or "").strip(),
+            "NOTES":         _cell_text(r.get("NOTES")),
             "TOTAL_CREW":    max(len(crew_list) + extra, 1),
             "CREW_LIST":     crew_list,
             "SCHEDULE_TYPE": "shifts",
             "TIME_ZONE":     branch_tz.get(branch, DEFAULT_TZ),
+            "LINK":          _cell_text(r.get(LINK_COL)),
         })
 
     if not rows:
@@ -468,7 +484,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
         eid     = row["EVENT_ID"]
         subject = f"{row['SHOW']} - {row['FUNCTION']}"
         end_dt  = row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"]
-        notes   = f"Foreman: {row['FOREMAN']}. {row['NOTES']}".strip()
+        notes   = _event_notes(row)
         fhash   = _field_hash(row)
         try:
             entry = cal_map.get(eid)
@@ -957,7 +973,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                     eid     = row["EVENT_ID"]
                     subject = f"{row['SHOW']} - {row['FUNCTION']}"
                     end_dt  = row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"]
-                    notes   = f"Foreman: {row['FOREMAN']}. {row['NOTES']}".strip()
+                    notes   = _event_notes(row)
                     fhash   = _field_hash(row)
                     stat.text(f"Processing {i+1}/{len(df_push)}: {str(row['SHOW'])[:60]}...")
                     try:
