@@ -170,7 +170,7 @@ def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
         payload = {
             "subject": subject, "isAllDay": False,
             "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
-            "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),     "timeZone": time_zone},
+            "end":   {"dateTime": _timed_end(end_dt, t_start, t_end),         "timeZone": time_zone},
             "location": {"displayName": location or "Not specified"},
             "body": {"contentType": "Text", "content": body_text},
         }
@@ -200,6 +200,15 @@ def _parse_time_range(time_str):
         return f"{int(h):02d}:{mi}"
     return pad(m.group(1)), pad(m.group(2))
 
+def _timed_end(end_dt, t_start, t_end):
+    """End dateTime string for a timed event. Overnight shifts ('22:00 - 02:00', '20:00 - 24:00')
+    end on the next day; otherwise Outlook rejects an end that is before the start."""
+    if t_end == "24:00":
+        t_end = "00:00"
+    if t_end <= t_start:
+        end_dt = end_dt + timedelta(days=1)
+    return end_dt.strftime(f"%Y-%m-%dT{t_end}:00")
+
 def create_graph_event(token, mailbox, subject, start_dt, end_dt,
                        location="", notes="", time_str="", event_id="", field_hash="", time_zone=DEFAULT_TZ):
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events"
@@ -210,7 +219,7 @@ def create_graph_event(token, mailbox, subject, start_dt, end_dt,
         payload = {
             "subject": subject, "isAllDay": False,
             "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
-            "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),   "timeZone": time_zone},
+            "end":   {"dateTime": _timed_end(end_dt, t_start, t_end),       "timeZone": time_zone},
             "location": {"displayName": location or "Not specified"},
             "body": {"contentType": "Text", "content": body_text},
         }
