@@ -73,6 +73,8 @@ st.markdown("""
 FUNCTION_COLORS = {"SET": "#3b82f6", "STRIKE": "#ef4444", "STANDBY": "#f59e0b"}
 LV_SHEET        = "By Day"
 LV_CREW_COLS    = [1, 2, 3, 4, 5, 6, 7]   # numeric header columns for crew slots
+LISTS_SHEET     = "Lists"                  # holds the BRANCH / STATE / TIME ZONE lookup
+DEFAULT_TZ      = "Pacific Standard Time"  # used when a row's branch has no lookup entry (e.g. legacy LV IDs)
 
 # ─── OUTLOOK BODY MARKERS ────────────────────────────────────────────
 # EVENT_ID and field hash are stored in the first line of the event body.
@@ -158,7 +160,8 @@ def _make_event_id(show, function, date):
     return f"{slug}-{function}-{date.strftime('%Y%m%d')}"
 
 def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
-                      location="", notes="", time_str="", event_id="", field_hash="", subject=""):
+                      location="", notes="", time_str="", event_id="", field_hash="", subject="",
+                      time_zone=DEFAULT_TZ):
     url     = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events/{graph_id}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     t_start, t_end = _parse_time_range(time_str)
@@ -166,8 +169,8 @@ def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
     if t_start and t_end:
         payload = {
             "subject": subject, "isAllDay": False,
-            "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": "Pacific Standard Time"},
-            "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),     "timeZone": "Pacific Standard Time"},
+            "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
+            "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),     "timeZone": time_zone},
             "location": {"displayName": location or "Not specified"},
             "body": {"contentType": "Text", "content": body_text},
         }
@@ -198,7 +201,7 @@ def _parse_time_range(time_str):
     return pad(m.group(1)), pad(m.group(2))
 
 def create_graph_event(token, mailbox, subject, start_dt, end_dt,
-                       location="", notes="", time_str="", event_id="", field_hash=""):
+                       location="", notes="", time_str="", event_id="", field_hash="", time_zone=DEFAULT_TZ):
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     t_start, t_end = _parse_time_range(time_str)
@@ -206,8 +209,8 @@ def create_graph_event(token, mailbox, subject, start_dt, end_dt,
     if t_start and t_end:
         payload = {
             "subject": subject, "isAllDay": False,
-            "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": "Pacific Standard Time"},
-            "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),   "timeZone": "Pacific Standard Time"},
+            "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
+            "end":   {"dateTime": end_dt.strftime(f"%Y-%m-%dT{t_end}:00"),   "timeZone": time_zone},
             "location": {"displayName": location or "Not specified"},
             "body": {"contentType": "Text", "content": body_text},
         }
@@ -269,13 +272,29 @@ def download_sharepoint_file(token, drive_id, item_id):
     return resp.content
 
 # ─── LV FORMAT IMPORTER ──────────────────────────────────────────────
+def _read_branch_time_zones(xl):
+    """Return {BRANCH: Outlook time zone} from the 'Lists' sheet, or {} if the sheet/table is absent."""
+    if LISTS_SHEET not in xl.sheet_names:
+        return {}
+    lists = xl.parse(LISTS_SHEET, header=0, dtype=str)
+    lists.columns = [str(c).strip().upper() for c in lists.columns]
+    if "BRANCH" not in lists.columns or "TIME ZONE" not in lists.columns:
+        return {}
+    pairs = lists[["BRANCH", "TIME ZONE"]].dropna()
+    return {b.strip().upper(): tz.strip() for b, tz in pairs.itertuples(index=False) if b.strip() and tz.strip()}
+
 def parse_lv_byDay(uploaded_file, sheet_name):
     """Parse the 'By Day' sheet from the LV GES Electrical Show Schedule format.
 
     Expected columns: DAY, DATE, TIME, SHOW, FUNCTION, LOCATION, NOTES, FOREMAN, 1..7
     Crew columns 1-7 hold names or '+N' (extra unnamed crew).
+    Each row's time zone comes from its ID prefix (e.g. 'ORL-0001' -> ORL) looked up in
+    the BRANCH / TIME ZONE table on the 'Lists' sheet; no prefix or no table -> DEFAULT_TZ.
     """
-    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
+    xl = pd.ExcelFile(uploaded_file)
+    # Read crew columns as text, otherwise a column holding only '+1' comes back as 1.0
+    raw = xl.parse(sheet_name, header=0, dtype={c: str for c in LV_CREW_COLS})
+    branch_tz = _read_branch_time_zones(xl)
 
     required = {"DATE", "SHOW", "FUNCTION", "LOCATION", "NOTES", "FOREMAN"}
     present  = {str(c).strip().upper() for c in raw.columns}
@@ -317,6 +336,11 @@ def parse_lv_byDay(uploaded_file, sheet_name):
             id_val = int(id_val)  # Excel numbers come in as 1.0 — store as "1"
         raw_id = str(id_val or "").strip()
         event_id = raw_id if raw_id and raw_id.lower() not in ("nan", "none") else _make_event_id(show, fn, date)
+        m = re.match(r"([A-Za-z]+)-\d", raw_id)
+        branch = m.group(1).upper() if m else ""
+        if branch and branch_tz and branch not in branch_tz:
+            raise ValueError(f"ID '{raw_id}': branch '{branch}' is not in the BRANCH / TIME ZONE table "
+                             f"on the '{LISTS_SHEET}' sheet.")
         rows.append({
             "EVENT_ID":      event_id,
             "DATE":          date,
@@ -330,6 +354,7 @@ def parse_lv_byDay(uploaded_file, sheet_name):
             "TOTAL_CREW":    max(len(crew_list) + extra, 1),
             "CREW_LIST":     crew_list,
             "SCHEDULE_TYPE": "shifts",
+            "TIME_ZONE":     branch_tz.get(branch, DEFAULT_TZ),
         })
 
     if not rows:
@@ -445,6 +470,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                                          row["DATE"], pd.Timestamp(end_dt),
                                          row["LOCATION"], notes,
                                          time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                         time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
                                          subject=subject)
                 if resp.status_code == 200:
                     updated += 1
@@ -452,7 +478,8 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                     resp2 = create_graph_event(token, mailbox, subject,
                                                row["DATE"], pd.Timestamp(end_dt),
                                                row["LOCATION"], notes,
-                                               time_str=row["TIME"], event_id=eid, field_hash=fhash)
+                                               time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                               time_zone=row.get("TIME_ZONE", DEFAULT_TZ))
                     created += 1 if resp2.status_code == 201 else 0
                     failed  += 0 if resp2.status_code == 201 else 1
                 else:
@@ -461,7 +488,8 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                 resp = create_graph_event(token, mailbox, subject,
                                           row["DATE"], pd.Timestamp(end_dt),
                                           row["LOCATION"], notes,
-                                          time_str=row["TIME"], event_id=eid, field_hash=fhash)
+                                          time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                          time_zone=row.get("TIME_ZONE", DEFAULT_TZ))
                 created += 1 if resp.status_code == 201 else 0
                 failed  += 0 if resp.status_code == 201 else 1
         except Exception:
@@ -934,6 +962,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
                                 subject=subject,
                             )
                             if resp.status_code == 200:
@@ -945,6 +974,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                     row["DATE"], pd.Timestamp(end_dt),
                                     row["LOCATION"], notes,
                                     time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                    time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
                                 )
                                 if resp2.status_code == 201:
                                     created += 1
@@ -963,6 +993,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
+                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
                             )
                             if resp.status_code == 201:
                                 created += 1
