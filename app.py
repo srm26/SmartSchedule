@@ -18,6 +18,8 @@ from zoneinfo import ZoneInfo
 _PT = ZoneInfo("America/Los_Angeles")
 import msal
 import requests
+from html import escape
+from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────
@@ -91,12 +93,16 @@ def _event_notes(row):
     """Outlook notes text: foreman, the NOTES column, and the SharePoint link on its own line."""
     notes = f"Foreman: {row['FOREMAN']}. {row['NOTES']}".strip()
     if row.get("LINK"):
-        notes += f"\nSharePoint: {row['LINK']}"
+        label = row.get("LINK_TEXT") or row["LINK"]
+        notes += f"\nSharePoint: [{label}]({row['LINK']})"  # turned into a clickable link by _make_body
     return notes
 
 def _make_body(notes, event_id, field_hash):
+    """HTML event body: marker line, then the notes; '[label](url)' becomes a clickable link."""
     marker = f"GES_ID:{event_id}|GES_HASH:{field_hash}"
-    return f"{marker}\n{notes}".strip() if notes else marker
+    html = escape(f"{marker}\n{notes}".strip() if notes else marker)
+    html = re.sub(r"\[([^\]\n]+)\]\((\S+?)\)", r'<a href="\2">\1</a>', html)
+    return html.replace("\n", "<br>")
 
 def _parse_body(body_content):
     """Extract (event_id, field_hash) from event body, or ('', '') if not present."""
@@ -195,7 +201,7 @@ def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
             "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
             "end":   {"dateTime": _timed_end(end_dt, t_start, t_end),         "timeZone": time_zone},
             "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "Text", "content": body_text},
+            "body": {"contentType": "HTML", "content": body_text},
         }
     else:
         payload = {
@@ -203,7 +209,7 @@ def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
             "start": {"dateTime": start_dt.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
             "end":   {"dateTime": (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
             "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "Text", "content": body_text},
+            "body": {"contentType": "HTML", "content": body_text},
         }
     return requests.patch(url, headers=headers, json=payload, timeout=15)
 
@@ -244,7 +250,7 @@ def create_graph_event(token, mailbox, subject, start_dt, end_dt,
             "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
             "end":   {"dateTime": _timed_end(end_dt, t_start, t_end),       "timeZone": time_zone},
             "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "Text", "content": body_text},
+            "body": {"contentType": "HTML", "content": body_text},
         }
     else:
         payload = {
@@ -252,7 +258,7 @@ def create_graph_event(token, mailbox, subject, start_dt, end_dt,
             "start": {"dateTime": start_dt.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
             "end":   {"dateTime": (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
             "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "Text", "content": body_text},
+            "body": {"contentType": "HTML", "content": body_text},
         }
     return requests.post(url, headers=headers, json=payload, timeout=15)
 
@@ -320,6 +326,26 @@ def _cell_text(val):
     s = str(val if val is not None else "").strip()
     return "" if s.lower() in ("nan", "none") else s
 
+def _read_link_urls(src, sheet_name):
+    """{ID: URL} for SHAREPOINT LINK cells that are hyperlinks. pandas only sees the text Excel
+    displays (often a file name), so the URL behind the cell is read with openpyxl."""
+    if hasattr(src, "seek"):
+        src.seek(0)
+    ws = load_workbook(src, data_only=True)[sheet_name]
+    header = [str(c.value).strip().upper() if c.value is not None else "" for c in ws[1]]
+    if LINK_COL not in header or "ID" not in header:
+        return {}
+    li, ii = header.index(LINK_COL), header.index("ID")
+    urls = {}
+    for row in ws.iter_rows(min_row=2):
+        cell = row[li]
+        if cell.hyperlink is not None and cell.hyperlink.target:
+            id_val = row[ii].value
+            if isinstance(id_val, float) and id_val.is_integer():
+                id_val = int(id_val)  # match parse_lv_byDay's ID handling
+            urls[_cell_text(id_val)] = cell.hyperlink.target
+    return urls
+
 def parse_lv_byDay(uploaded_file, sheet_name):
     """Parse the 'By Day' sheet from the LV GES Electrical Show Schedule format.
 
@@ -332,6 +358,7 @@ def parse_lv_byDay(uploaded_file, sheet_name):
     # Read crew columns as text, otherwise a column holding only '+1' comes back as 1.0
     raw = xl.parse(sheet_name, header=0, dtype={c: str for c in LV_CREW_COLS})
     branch_tz = _read_branch_time_zones(xl)
+    link_urls = _read_link_urls(uploaded_file, sheet_name) if LINK_COL in raw.columns else {}
 
     required = {"DATE", "SHOW", "FUNCTION", "LOCATION", "NOTES", "FOREMAN"}
     present  = {str(c).strip().upper() for c in raw.columns}
@@ -392,7 +419,9 @@ def parse_lv_byDay(uploaded_file, sheet_name):
             "CREW_LIST":     crew_list,
             "SCHEDULE_TYPE": "shifts",
             "TIME_ZONE":     branch_tz.get(branch, DEFAULT_TZ),
-            "LINK":          _cell_text(r.get(LINK_COL)),
+            # LINK = the URL (from the hyperlink behind the cell if there is one); LINK_TEXT = what the cell shows
+            "LINK":          link_urls.get(raw_id) or _cell_text(r.get(LINK_COL)),
+            "LINK_TEXT":     _cell_text(r.get(LINK_COL)),
             "BRANCH":        branch,
         })
 
