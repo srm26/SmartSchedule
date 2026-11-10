@@ -52,7 +52,7 @@ BRANCHES = {
 # A calendar without a mailbox setting is treated as unmapped: its rows are not pushed.
 CALENDARS = {
     "LOEWS_ELECTRICAL": "Loews Electrical",
-    "ORL_MARRIOTT":     "Orlando Marriott",      # may share the ORL calendar: point it at the same mailbox
+    "ORL_MARRIOTT":     "Orlando Marriott",      # separate from Loews (own spreadsheet, ORLM- IDs)
     "LV_ELECTRICAL":    "Las Vegas Electrical",
     "CHI_ELECTRICAL":   "Chicago Electrical",
 }
