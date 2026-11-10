@@ -21,7 +21,7 @@ import requests
 from html import escape
 from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
-from schedule_config import FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, OUTLOOK_CATEGORIES
+from schedule_config import FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, OUTLOOK_CATEGORIES, CONFIG_WARNINGS
 from schedule_logic import facility_route, has_facility, compute_overtime, ot_summary
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ def _mailbox_for(branch):
     return mapping.get(str(branch or "").upper()) or _graph_cfg()["shared_mailbox"]
 
 def _route_rows(df):
-    """(mailbox, error) per row. Rows with a FACILITY go to that facility's calendar (schedule_config.py +
+    """(mailbox, error) per row. Rows with a FACILITY go to that facility's calendar (FACILITY_ settings +
     GRAPH_CALENDAR_MAILBOXES); an unknown or unmapped facility gets an error and is not pushed.
     A blank FACILITY (cities without facilities) goes to the city's calendar from the ID prefix, only if
     that branch is listed in GRAPH_BRANCH_MAILBOXES; otherwise it's an error too.
@@ -671,6 +671,7 @@ def run_sweep():
         elif limit == 0:
             log.append("⚠️ Deletes skipped — could not read: " + ", ".join(errors))
 
+        log += [f"⚠️ {w}" for w in CONFIG_WARNINGS]  # facility / branch / OT settings that couldn't be read
         cat_checked = set()  # mailboxes whose Outlook categories (event colors) were checked this sweep
         for f in sp_files:
             fname    = f["name"]
@@ -1058,6 +1059,8 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
         else:
             g              = _graph_cfg()
             shared_mailbox = g["shared_mailbox"]
+            for w in CONFIG_WARNINGS:  # facility / branch / OT app settings that couldn't be read
+                st.warning(w)
             # Each row goes to its facility's calendar (files without FACILITY: by ID prefix)
             mbx_s, err_s = _route_rows(df)
             ok_s = err_s == ""
@@ -1504,7 +1507,7 @@ elif "Crew" in page:
 # ═══════════════════════════════════════════════════════════════════
 elif "Overtime" in page:
     st.markdown('<div class="section-title">Overtime</div>', unsafe_allow_html=True)
-    st.caption(f"Source: **{st.session_state.file_name}** · rules and holidays are set in schedule_config.py")
+    st.caption(f"Source: **{st.session_state.file_name}** · rules and holidays come from the OT_RULES_ / HOLIDAYS_ app settings")
 
     ot_all = compute_overtime(df)  # on the whole file, so daily totals see every shift before filtering
     if ot_all.empty:

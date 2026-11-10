@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Facility routing and overtime calculation. No Streamlit here, so it can be tested on its own.
-All facility / calendar / rule data comes from schedule_config.py.
+All facility / calendar / rule data comes from schedule_config.py, which reads the app settings.
 """
 import re
 import pandas as pd

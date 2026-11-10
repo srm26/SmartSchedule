@@ -15,6 +15,11 @@ from openpyxl import load_workbook
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# Facility / branch / OT settings come from environment variables; use the test copy, not Azure or local files
+for _line in (Path(__file__).with_name("settings.test.env")).read_text(encoding="utf8").splitlines():
+    _name, _sep, _value = _line.partition("=")
+    if _sep and not _line.startswith("#"):
+        os.environ[_name.strip()] = _value
 from schedule_config import FACILITIES, HOLIDAYS                                   # noqa: E402
 from schedule_logic import facility_route, compute_overtime, ot_summary, shift_span  # noqa: E402
 
@@ -325,6 +330,57 @@ class OutlookColors(unittest.TestCase):
         self.assertIn("MailboxSettings.ReadWrite", err)
         self.assertIn("SET (green)", err)
         self.assertIn("STRIKE (red)", err)
+
+
+class SettingsParsing(unittest.TestCase):
+    """schedule_config.load: one app setting per item, bad ones skipped with a warning."""
+
+    def load(self, settings):
+        import schedule_config
+        return schedule_config.load(settings)
+
+    def test_loads_all_kinds(self):
+        fac, br, ot, hol, cat, warn = self.load({
+            "FACILITY_GAYPAL": "Gaylord Palms; Orlando; fl; gaylord; #66cc66; orl",
+            "BRANCH_NSH": "Tennessee; TN; Central Standard Time",
+            "OT_RULES_ORL": "8; Saturday; Sunday; Holidays",
+            "HOLIDAYS_ORL": "2027-01-01, 2027-12-24",
+            "OUTLOOK_COLOR_BOOTH_CHECK": "Blue"})
+        self.assertEqual(fac["GAYPAL"], {"name": "Gaylord Palms", "city": "Orlando", "state": "FL",
+                                         "calendar": "GAYLORD", "excel_color": "66CC66", "ot_region": "ORL"})
+        self.assertEqual(br["NSH"]["state_code"], "TN")
+        self.assertEqual(ot["ORL"], {"daily_hours": 8, "saturday": True, "sunday": True, "holidays": True})
+        self.assertEqual(hol["ORL"], ["2027-01-01", "2027-12-24"])
+        self.assertEqual(cat["BOOTH CHECK"], {"name": "BOOTH CHECK", "color": "preset7"})
+        self.assertEqual(warn, [])
+
+    def test_blank_parts_mean_not_provided(self):
+        fac = self.load({"FACILITY_HILLV": "Westgate; Las Vegas; NV; LV_ELECTRICAL; ; "})[0]
+        self.assertIsNone(fac["HILLV"]["excel_color"])
+        self.assertIsNone(fac["HILLV"]["ot_region"])
+
+    def test_bad_settings_are_skipped_with_warnings(self):
+        fac, br, ot, hol, cat, warn = self.load({
+            "FACILITY_GOOD": "Good; Orlando; FL; LOEWS_ELECTRICAL; ; ",
+            "FACILITY_BAD1": "Bad; Orlando; Florida; X; ; ",        # state not 2 letters
+            "FACILITY_BAD2": "Bad; Orlando; FL; X; pink; ",          # color not hex
+            "BRANCH_X": "Nevada; NV",                                # missing time zone
+            "OT_RULES_X": "Saturday; Sunday",                        # no daily hours
+            "HOLIDAYS_X": "Jan 1",                                   # bad date
+            "OUTLOOK_COLOR_SET": "sparkly"})                         # unknown color
+        self.assertEqual(list(fac), ["GOOD"])
+        self.assertEqual((br, ot, hol, cat), ({}, {}, {}, {}))
+        self.assertEqual(len(warn), 6)
+        self.assertTrue(any("FACILITY_BAD1" in w and "2 letters" in w for w in warn))
+
+    def test_missing_facilities_and_ot_region_warn(self):
+        warn = self.load({"FACILITY_A": "A; X; FL; CAL; ; NOPE"})[5]
+        self.assertTrue(any("OT_RULES_NOPE" in w for w in warn))
+        self.assertTrue(any("No FACILITY_" in w for w in self.load({})[5]))
+
+    def test_test_settings_match_the_business_list(self):
+        self.assertEqual(sorted(FACILITIES), ["HARROC", "HELIOS", "HILLV", "LSAPP", "MARWCR", "PORBAY",
+                                              "ROYPAC", "SHECHI"])
 
 
 if __name__ == "__main__":

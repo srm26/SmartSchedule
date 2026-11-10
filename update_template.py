@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Add / refresh the FACILITY column on the Excel scheduling template, using schedule_config.py:
+Add / refresh the FACILITY column on the Excel scheduling template, using the FACILITY_ / BRANCH_
+settings (see schedule_config.py):
   - FACILITY column on 'By Day' (inserted before LOCATION if missing) with a dropdown of facility codes
   - facility code table on the 'Lists' sheet (the dropdown's source)
   - conditional formatting that colors the whole row by facility (FACILITIES[...]['excel_color'])
-Safe to run again after editing schedule_config.py (e.g. adding a color).
+Safe to run again after changing a facility or color.
 
-Usage:  python update_template.py ["path\\to\\file.xlsx"]     (default: the template in templates\\)
+Usage:  python update_template.py [--from-azure] ["path\\to\\file.xlsx"]   (default: the template in templates\\)
+  --from-azure  use the live App Service settings (needs 'az login'); otherwise settings.local.env
 The file is overwritten; keep a copy first.
 """
 import sys
@@ -16,6 +18,7 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+import schedule_config
 from schedule_config import FACILITIES, BRANCHES
 
 DEFAULT_PATH = r"templates\GES Electrical Show Schedule TEMPLATE.xlsx"
@@ -124,6 +127,20 @@ def _update_instructions(ws):
             ws.cell(r, 1)._style = copy(c._style)
             break
 
+APP, RG = "app-wus2-elecsch-dv-01", "rg-wus2-elecsch-dv-compute"
+
+def _use_azure_settings():
+    """Replace FACILITIES / BRANCHES with the ones built from the live App Service settings."""
+    import json, subprocess
+    global FACILITIES, BRANCHES
+    out = subprocess.run(f"az webapp config appsettings list --name {APP} --resource-group {RG} -o json",
+                         capture_output=True, text=True, shell=True, check=True).stdout
+    settings = {s["name"]: s["value"] for s in json.loads(out) if s["name"].upper().startswith(schedule_config.PREFIXES)}
+    FACILITIES, BRANCHES, *_, warnings = schedule_config.load(settings)
+    for w in warnings:
+        print("WARNING:", w)
+    print(f"Using Azure settings: {len(FACILITIES)} facilities, {len(BRANCHES)} branches.")
+
 def main(path):
     wb = load_workbook(path)
     ws = wb["By Day"]
@@ -141,4 +158,7 @@ def main(path):
     print(f"Updated {path}: FACILITY in column {get_column_letter(fac_col)}, rows 2-{last_row}.")
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PATH)
+    args = [a for a in sys.argv[1:] if a != "--from-azure"]
+    if "--from-azure" in sys.argv:
+        _use_azure_settings()
+    main(args[0] if args else DEFAULT_PATH)
