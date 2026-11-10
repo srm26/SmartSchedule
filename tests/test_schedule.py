@@ -235,5 +235,57 @@ class Overtime(unittest.TestCase):
         self.assertEqual(s["OT Hours"].sum(), ps["OT_HOURS"].sum())
 
 
+class OutlookColors(unittest.TestCase):
+    """SET / STRIKE events get an Outlook category (color); other functions don't."""
+
+    def setUp(self):
+        import hashlib, types
+        from schedule_config import OUTLOOK_CATEGORIES
+        self.sent = []
+        fake = types.SimpleNamespace(
+            post=lambda url, headers=None, json=None, timeout=None: self.sent.append(("post", url, json)),
+            patch=lambda url, headers=None, json=None, timeout=None: self.sent.append(("patch", url, json)),
+            get=lambda url, headers=None, timeout=None: types.SimpleNamespace(status_code=403, json=lambda: {}))
+        self.ns = _load_app_functions(
+            {"_field_hash", "_event_categories", "create_graph_event", "patch_graph_event", "_parse_time_range",
+             "_timed_end", "_make_body", "ensure_outlook_categories"},
+            {"hashlib": hashlib, "OUTLOOK_CATEGORIES": OUTLOOK_CATEGORIES, "requests": fake,
+             "timedelta": __import__("datetime").timedelta, "escape": __import__("html").escape})
+
+    def row(self, fn):
+        return {"DATE": "2027-01-06", "SHOW": "S", "FUNCTION": fn, "TIME": "08:00 - 12:00", "LOCATION": "",
+                "FOREMAN": "TBD", "NOTES": ""}
+
+    def test_categories_by_function(self):
+        cats = self.ns["_event_categories"]
+        self.assertEqual(cats(self.row("SET")), ["SET"])
+        self.assertEqual(cats(self.row("STRIKE")), ["STRIKE"])
+        self.assertEqual(cats(self.row("BOOTH CHECK")), [])
+        self.assertEqual(cats(self.row("SET/STRIKE")), [])
+
+    def test_hash_unchanged_for_uncolored_functions(self):
+        import hashlib
+        r = self.row("PREP")
+        old = hashlib.md5("|".join(str(r.get(f, "")) for f in
+                                   ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8]
+        self.assertEqual(self.ns["_field_hash"](r), old)           # no needless Outlook updates
+        self.assertNotEqual(self.ns["_field_hash"](self.row("SET")),
+                            hashlib.md5("|".join(str(self.row("SET").get(f, "")) for f in
+                                                 ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8])
+
+    def test_payload_carries_categories(self):
+        ts = pd.Timestamp("2027-01-06")
+        self.ns["create_graph_event"]("t", "m@x.com", "S - SET", ts, ts, time_str="08:00 - 12:00", categories=["SET"])
+        self.ns["patch_graph_event"]("t", "m@x.com", "gid", ts, ts, time_str="08:00 - 12:00")
+        self.assertEqual(self.sent[0][2]["categories"], ["SET"])
+        self.assertEqual(self.sent[1][2]["categories"], [])        # function changed away from SET: color removed
+
+    def test_missing_permission_reports_but_does_not_raise(self):
+        err = self.ns["ensure_outlook_categories"]("t", "m@x.com")
+        self.assertIn("MailboxSettings.ReadWrite", err)
+        self.assertIn("SET (green)", err)
+        self.assertIn("STRIKE (red)", err)
+
+
 if __name__ == "__main__":
     unittest.main()

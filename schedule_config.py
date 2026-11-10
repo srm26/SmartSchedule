@@ -43,6 +43,18 @@ CALENDARS = {
     "LOEWS_ELECTRICAL": "Loews Electrical",
 }
 
+# ─── OUTLOOK EVENT COLORS ────────────────────────────────────────────
+# FUNCTION -> Outlook category put on the event; the category's color shows on the calendar.
+# Functions not listed get no category (normal calendar color).
+# color = Outlook preset: preset0 red, preset1 orange, preset2 brown, preset3 yellow, preset4 green,
+#         preset5 teal, preset6 olive, preset7 blue, preset8 purple, preset9 cranberry, preset12 gray
+# The app creates missing categories in each calendar (needs the MailboxSettings.ReadWrite Graph
+# permission); an existing category keeps whatever color it already has in that calendar.
+OUTLOOK_CATEGORIES = {
+    "SET":    {"name": "SET",    "color": "preset4"},   # green
+    "STRIKE": {"name": "STRIKE", "color": "preset0"},   # red
+}
+
 # ─── OVERTIME RULES ──────────────────────────────────────────────────
 # region -> rules. Each OT hour is counted once, with the first matching reason in this order:
 # holiday, Sunday, Saturday, over daily_hours on a normal workday.

@@ -21,7 +21,7 @@ import requests
 from html import escape
 from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
-from schedule_config import FACILITIES, OT_RULES, HOLIDAYS, DT_RULES
+from schedule_config import FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, OUTLOOK_CATEGORIES
 from schedule_logic import facility_route, has_facility, compute_overtime, ot_summary
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────
@@ -94,7 +94,37 @@ def _field_hash(row):
     key = "|".join(str(row.get(f, "")) for f in ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"])
     if row.get("LINK"):  # only when present, so rows without a link keep their existing hash
         key += "|" + str(row["LINK"])
+    if _event_categories(row):  # same idea: only colored functions get a new hash (one-time update)
+        key += "|cat:" + ",".join(_event_categories(row))
     return hashlib.md5(key.encode()).hexdigest()[:8]
+
+def _event_categories(row):
+    """Outlook categories (event color) for the row's FUNCTION, from OUTLOOK_CATEGORIES."""
+    cat = OUTLOOK_CATEGORIES.get(str(row.get("FUNCTION", "")).upper())
+    return [cat["name"]] if cat else []
+
+_PRESET_NAMES = {"preset0": "red", "preset1": "orange", "preset2": "brown", "preset3": "yellow", "preset4": "green",
+                 "preset5": "teal", "preset6": "olive", "preset7": "blue", "preset8": "purple",
+                 "preset9": "cranberry", "preset12": "gray"}
+
+def ensure_outlook_categories(token, mailbox):
+    """Create missing OUTLOOK_CATEGORIES (name + color) in the mailbox's category list.
+    Returns '' or an error message (e.g. missing MailboxSettings.ReadWrite permission)."""
+    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/outlook/masterCategories"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return (f"could not read Outlook categories in {mailbox} ({resp.status_code}). Events are still tagged; "
+                f"to show colors, grant the app MailboxSettings.ReadWrite or create the categories by hand: "
+                + ", ".join(f"{c['name']} ({_PRESET_NAMES.get(c['color'], c['color'])})"
+                            for c in OUTLOOK_CATEGORIES.values()))
+    have = {c["displayName"].lower() for c in resp.json().get("value", [])}
+    for c in OUTLOOK_CATEGORIES.values():
+        if c["name"].lower() not in have:
+            r = requests.post(url, headers=headers, json={"displayName": c["name"], "color": c["color"]}, timeout=15)
+            if r.status_code not in (200, 201):
+                return f"could not create Outlook category {c['name']} in {mailbox} ({r.status_code})"
+    return ""
 
 def _event_notes(row):
     """Outlook notes text: foreman, the NOTES column, and the SharePoint link on its own line."""
@@ -227,7 +257,7 @@ def _make_event_id(show, function, date):
 
 def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
                       location="", notes="", time_str="", event_id="", field_hash="", subject="",
-                      time_zone=DEFAULT_TZ):
+                      time_zone=DEFAULT_TZ, categories=None):
     url     = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events/{graph_id}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     t_start, t_end = _parse_time_range(time_str)
@@ -248,6 +278,7 @@ def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
             "location": {"displayName": location or "Not specified"},
             "body": {"contentType": "HTML", "content": body_text},
         }
+    payload["categories"] = categories or []
     return requests.patch(url, headers=headers, json=payload, timeout=15)
 
 def delete_graph_event(token, mailbox, graph_id):
@@ -276,7 +307,8 @@ def _timed_end(end_dt, t_start, t_end):
     return end_dt.strftime(f"%Y-%m-%dT{t_end}:00")
 
 def create_graph_event(token, mailbox, subject, start_dt, end_dt,
-                       location="", notes="", time_str="", event_id="", field_hash="", time_zone=DEFAULT_TZ):
+                       location="", notes="", time_str="", event_id="", field_hash="", time_zone=DEFAULT_TZ,
+                       categories=None):
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     t_start, t_end = _parse_time_range(time_str)
@@ -297,6 +329,7 @@ def create_graph_event(token, mailbox, subject, start_dt, end_dt,
             "location": {"displayName": location or "Not specified"},
             "body": {"contentType": "HTML", "content": body_text},
         }
+    payload["categories"] = categories or []
     return requests.post(url, headers=headers, json=payload, timeout=15)
 
 # ─── SHAREPOINT HELPERS ──────────────────────────────────────────────
@@ -581,7 +614,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                                          row["DATE"], pd.Timestamp(end_dt),
                                          row["LOCATION"], notes,
                                          time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                         time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
+                                         time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
                                          subject=subject)
                 if resp.status_code == 200:
                     updated += 1
@@ -590,7 +623,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                                                row["DATE"], pd.Timestamp(end_dt),
                                                row["LOCATION"], notes,
                                                time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                               time_zone=row.get("TIME_ZONE", DEFAULT_TZ))
+                                               time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row))
                     created += 1 if resp2.status_code == 201 else 0
                     failed  += 0 if resp2.status_code == 201 else 1
                 else:
@@ -600,7 +633,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
                                           row["DATE"], pd.Timestamp(end_dt),
                                           row["LOCATION"], notes,
                                           time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                          time_zone=row.get("TIME_ZONE", DEFAULT_TZ))
+                                          time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row))
                 created += 1 if resp.status_code == 201 else 0
                 failed  += 0 if resp.status_code == 201 else 1
         except Exception:
@@ -638,6 +671,7 @@ def run_sweep():
         elif limit == 0:
             log.append("⚠️ Deletes skipped — could not read: " + ", ".join(errors))
 
+        cat_checked = set()  # mailboxes whose Outlook categories (event colors) were checked this sweep
         for f in sp_files:
             fname    = f["name"]
             last_mod = f["modified"]
@@ -657,6 +691,10 @@ def run_sweep():
                 ok     = err_s == ""
                 stats  = {"created": 0, "updated": 0, "deleted": 0, "skipped": 0, "failed": 0}
                 for mbx, grp in df_f[ok].groupby(mbx_s[ok]):
+                    if mbx not in cat_checked:
+                        cat_checked.add(mbx)
+                        if (cat_err := ensure_outlook_categories(token, mbx)):
+                            log.append(f"⚠️ Event colors: {cat_err}")
                     for k, v in _sync_dataframe(token, mbx, grp, keep_ids).items():
                         stats[k] += v
                 result = (f"Created:{stats['created']} Updated:{stats['updated']} "
@@ -1101,6 +1139,9 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                 stat.text("Reading shared calendar from Outlook...")
                 cal_maps = {m: build_calendar_map(token, m, df["DATE"].min(), df["DATE"].max())
                             for m in set(mbx_s[ok_s])}
+                for m in cal_maps:  # SET / STRIKE colors (OUTLOOK_CATEGORIES); push continues either way
+                    if (cat_err := ensure_outlook_categories(token, m)):
+                        st.warning(f"Event colors: {cat_err}")
 
                 bar = st.progress(0)
                 for i, (idx, row) in enumerate(df_push.iterrows()):
@@ -1128,7 +1169,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
+                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
                                 subject=subject,
                             )
                             if resp.status_code == 200:
@@ -1140,7 +1181,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                     row["DATE"], pd.Timestamp(end_dt),
                                     row["LOCATION"], notes,
                                     time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                    time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
+                                    time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
                                 )
                                 if resp2.status_code == 201:
                                     created += 1
@@ -1159,7 +1200,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                                 row["DATE"], pd.Timestamp(end_dt),
                                 row["LOCATION"], notes,
                                 time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ),
+                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
                             )
                             if resp.status_code == 201:
                                 created += 1
