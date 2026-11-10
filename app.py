@@ -21,6 +21,8 @@ import requests
 from html import escape
 from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
+from schedule_config import FACILITIES, OT_RULES, HOLIDAYS, DT_RULES
+from schedule_logic import facility_route, has_facility, compute_overtime, ot_summary
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────
 st.set_page_config(
@@ -40,6 +42,10 @@ st.markdown("""
   [data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]:hover {
     background: #3b4470; border-color: #e2e8f0; }
   [data-testid="stSidebar"] .stRadio label { font-size: 15px; padding: 6px 0; }
+  /* Status boxes in the sidebar ("No file loaded", "Last check", file name): white box, dark text */
+  [data-testid="stSidebar"] [data-testid="stAlertContainer"] {
+    background: #fff !important; border: 1px solid #cbd5e1; border-left: 4px solid #f59e0b; }
+  [data-testid="stSidebar"] [data-testid="stAlertContainer"] * { color: #1e293b !important; }
   .metric-card {
     background:#fff; border:1px solid #e2e8f0; border-radius:12px;
     padding:20px 24px; box-shadow:0 1px 4px rgba(0,0,0,.06);
@@ -78,6 +84,7 @@ LV_CREW_COLS    = [1, 2, 3, 4, 5, 6, 7]   # numeric header columns for crew slot
 LISTS_SHEET     = "Lists"                  # holds the BRANCH / STATE / TIME ZONE lookup
 DEFAULT_TZ      = "Pacific Standard Time"  # used when a row's branch has no lookup entry (e.g. legacy LV IDs)
 LINK_COL        = "SHAREPOINT LINK"        # optional By Day column; shown on the Outlook event notes
+FACILITY_COL    = "FACILITY"               # By Day column; facility code that picks the Outlook calendar
 
 # ─── OUTLOOK BODY MARKERS ────────────────────────────────────────────
 # EVENT_ID and field hash are stored in the first line of the event body.
@@ -153,18 +160,35 @@ def _graph_cfg():
     except Exception:
         return env
 
-def _mailbox_for(branch):
-    """Shared mailbox for a branch, from GRAPH_BRANCH_MAILBOXES ('LV=a@x.com; ORL=b@x.com',
-    app setting or secrets.toml branch_mailboxes). Unlisted branches use the default shared mailbox."""
-    raw = os.environ.get("GRAPH_BRANCH_MAILBOXES")
+def _mailbox_setting(env_name, secrets_key):
+    """{KEY: mailbox} from a 'KEY=a@x.com; KEY2=b@x.com' app setting, or the secrets.toml key locally."""
+    raw = os.environ.get(env_name)
     if raw is None:
-        raw = _graph_cfg().get("branch_mailboxes", "")
+        raw = _graph_cfg().get(secrets_key, "")
     mapping = {}
     for pair in str(raw).split(";"):
         if "=" in pair:
-            b, mbx = pair.split("=", 1)
-            mapping[b.strip().upper()] = mbx.strip()
+            k, mbx = pair.split("=", 1)
+            if mbx.strip():
+                mapping[k.strip().upper()] = mbx.strip()
+    return mapping
+
+def _mailbox_for(branch):
+    """Shared mailbox for a branch, from GRAPH_BRANCH_MAILBOXES ('LV=a@x.com; ORL=b@x.com',
+    app setting or secrets.toml branch_mailboxes). Unlisted branches use the default shared mailbox."""
+    mapping = _mailbox_setting("GRAPH_BRANCH_MAILBOXES", "branch_mailboxes")
     return mapping.get(str(branch or "").upper()) or _graph_cfg()["shared_mailbox"]
+
+def _route_rows(df):
+    """(mailbox, error) per row. Rows with a FACILITY go to that facility's calendar (schedule_config.py +
+    GRAPH_CALENDAR_MAILBOXES); a blank, unknown or unmapped facility gets an error and is not pushed.
+    Files without a FACILITY column keep the older routing by ID prefix (_mailbox_for)."""
+    cal_mbx = _mailbox_setting("GRAPH_CALENDAR_MAILBOXES", "calendar_mailboxes")
+    routes = [facility_route(r["FACILITY"], cal_mbx) if has_facility(r["FACILITY"])
+              else (_mailbox_for(r["BRANCH"]), "")
+              for _, r in df.iterrows()]
+    return (pd.Series([m for m, _ in routes], index=df.index, dtype=object),
+            pd.Series([e for _, e in routes], index=df.index, dtype=object))
 
 def _graph_secrets_ok():
     try:
@@ -353,6 +377,8 @@ def parse_lv_byDay(uploaded_file, sheet_name):
     Crew columns 1-7 hold names or '+N' (extra unnamed crew).
     Each row's time zone comes from its ID prefix (e.g. 'ORL-0001' -> ORL) looked up in
     the BRANCH / TIME ZONE table on the 'Lists' sheet; no prefix or no table -> DEFAULT_TZ.
+    Optional FACILITY column (facility code, picks the Outlook calendar per row): stored upper-cased;
+    None on every row when the file has no FACILITY column.
     """
     xl = pd.ExcelFile(uploaded_file)
     # Read crew columns as text, otherwise a column holding only '+1' comes back as 1.0
@@ -367,6 +393,7 @@ def parse_lv_byDay(uploaded_file, sheet_name):
         raise ValueError(f"Sheet '{sheet_name}' is missing expected columns: {', '.join(sorted(missing))}")
 
     crew_cols = [c for c in raw.columns if isinstance(c, int)]
+    has_fac   = FACILITY_COL in raw.columns
 
     rows = []
     for _, r in raw.iterrows():
@@ -423,6 +450,8 @@ def parse_lv_byDay(uploaded_file, sheet_name):
             "LINK":          link_urls.get(raw_id) or _cell_text(r.get(LINK_COL)),
             "LINK_TEXT":     _cell_text(r.get(LINK_COL)),
             "BRANCH":        branch,
+            "FACILITY":      _cell_text(r.get(FACILITY_COL)).upper() if has_fac else None,
+            "EXTRA_CREW":    extra,  # unnamed '+N' crew, used by the Overtime page
         })
 
     if not rows:
@@ -519,8 +548,9 @@ def _load_folder(token):
 
 def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
     """Run create/update sync for one parsed dataframe. Returns stats dict.
-    Deletes Outlook events in the date range whose ID is not in keep_ids;
-    pass keep_ids=None to skip deletes (test mode)."""
+    keep_ids: {EVENT_ID: mailbox the row now routes to (None if it can't be routed)}.
+    Deletes Outlook events in the date range whose ID is not in keep_ids, or whose row now routes to a
+    different mailbox (facility changed); pass keep_ids=None to skip deletes (test mode)."""
     cal_map = build_calendar_map(token, mailbox, df_file["DATE"].min(), df_file["DATE"].max())
     created = updated = deleted = skipped = failed = 0
     for _, row in df_file.iterrows():
@@ -565,7 +595,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
 
     if keep_ids is not None:
         for eid, entry in cal_map.items():
-            if eid not in keep_ids:
+            if eid not in keep_ids or keep_ids[eid] not in (None, mailbox):
                 dresp = delete_graph_event(token, mailbox, entry["graph_id"])
                 if dresp.status_code in (200, 204):
                     deleted += 1
@@ -589,7 +619,9 @@ def run_sweep():
         # If any file failed to parse, skip deletes rather than risk removing its events.
         keep_ids = None
         if limit == 0 and not errors:
-            keep_ids = set().union(*(set(d["EVENT_ID"]) for d in parsed.values()))
+            keep_ids = {}
+            for d in parsed.values():
+                keep_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
         elif limit == 0:
             log.append("⚠️ Deletes skipped — could not read: " + ", ".join(errors))
 
@@ -607,14 +639,20 @@ def run_sweep():
                 df_f   = parsed[fname]
                 if limit > 0:
                     df_f = df_f.head(limit)
-                # Each branch's rows go to that branch's shared mailbox
+                # Each row goes to its facility's calendar; rows that can't be routed are not pushed
+                mbx_s, err_s = _route_rows(df_f)
+                ok     = err_s == ""
                 stats  = {"created": 0, "updated": 0, "deleted": 0, "skipped": 0, "failed": 0}
-                for mbx, grp in df_f.groupby(df_f["BRANCH"].map(_mailbox_for)):
+                for mbx, grp in df_f[ok].groupby(mbx_s[ok]):
                     for k, v in _sync_dataframe(token, mbx, grp, keep_ids).items():
                         stats[k] += v
                 result = (f"Created:{stats['created']} Updated:{stats['updated']} "
                           f"Deleted:{stats['deleted']} Skipped:{stats['skipped']} Failed:{stats['failed']}")
-                state[fname] = {"last_modified": last_mod,
+                if not ok.all():
+                    bad = [f"{e}: {m}" for e, m in zip(df_f.loc[~ok, "EVENT_ID"], err_s[~ok])]
+                    result += f" Not pushed:{len(bad)} ({'; '.join(bad[:3])}{'; ...' if len(bad) > 3 else ''})"
+                # Rows not pushed are retried next sweep (e.g. once their calendar mailbox is configured)
+                state[fname] = {"last_modified": last_mod if ok.all() else None,
                                 "last_synced":   dt.now(_PT).strftime("%Y-%m-%d %H:%M PT"),
                                 "result":        result}
                 log.append(f"✅ {fname} — {result}")
@@ -671,7 +709,7 @@ with st.sidebar:
         st.divider()
         page = st.radio(
             "Navigation",
-            ["Dashboard", "Schedule & Push", "Calendar View", "Crew Lookup"],
+            ["Dashboard", "Schedule & Push", "Calendar View", "Crew Lookup", "Overtime"],
             key="nav", label_visibility="collapsed",
         )
     else:
@@ -797,9 +835,14 @@ if st.session_state.df is None:
             st.stop()
 
         st.success(f"**{len(parsed):,} shifts** found across **{parsed['SHOW'].nunique()}** shows.")
+        _, _errs = _route_rows(parsed)
+        if (_errs != "").any():
+            st.warning(f"**{int((_errs != '').sum())}** row(s) have a FACILITY problem and will not be pushed "
+                       f"to Outlook (details on the Push to Outlook tab).")
 
         with st.expander("Preview (first 10 rows)"):
-            p = parsed[["DATE","SHOW","FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]].head(10).copy()
+            _fac = ["FACILITY"] if has_facility(parsed["FACILITY"].iloc[0]) else []
+            p = parsed[["DATE","SHOW"] + _fac + ["FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]].head(10).copy()
             p["DATE"] = p["DATE"].dt.strftime("%Y-%m-%d")
             st.dataframe(p, hide_index=True, use_container_width=True)
 
@@ -887,7 +930,8 @@ elif "Schedule" in page:
     # ── Preview ──────────────────────────────────────────────────────
     with tab_prev:
         st.caption(f"Source: **{st.session_state.file_name}** · {len(df):,} rows · {stype}")
-        show_cols = [c for c in ["DATE","SHOW","FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"] if c in df.columns]
+        show_cols = [c for c in ["DATE","SHOW","FACILITY","FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]
+                     if c in df.columns and (c != "FACILITY" or has_facility(df["FACILITY"].iloc[0]))]
         d = df[show_cols].copy()
         d["DATE"] = d["DATE"].dt.strftime("%Y-%m-%d")
         st.dataframe(d, use_container_width=True, hide_index=True)
@@ -963,9 +1007,25 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
         else:
             g              = _graph_cfg()
             shared_mailbox = g["shared_mailbox"]
-            # Each branch (ID prefix) pushes to its own shared mailbox; unlisted branches use the default
-            mbx_of = {b: _mailbox_for(b) for b in df["BRANCH"].unique()}
-            st.info("Pushing to: " + ", ".join(f"**{b or 'no prefix'}** → {m}" for b, m in mbx_of.items()))
+            # Each row goes to its facility's calendar (files without FACILITY: by ID prefix)
+            mbx_s, err_s = _route_rows(df)
+            ok_s = err_s == ""
+            if not has_facility(df["FACILITY"].iloc[0]):
+                st.warning(f"This file has no **{FACILITY_COL}** column, so rows are routed by ID prefix "
+                           f"(older format). Move the rows to the current template to route by facility.")
+                key_col = "BRANCH"
+            else:
+                key_col = "FACILITY"
+            if ok_s.any():
+                dest = df[ok_s].groupby(mbx_s[ok_s])[key_col].unique()
+                st.info("Pushing to: " + "; ".join(f"**{', '.join(sorted(k or 'no prefix' for k in ks))}** → {m}"
+                                                   for m, ks in dest.items()))
+            if not ok_s.all():
+                st.error(f"**{int((~ok_s).sum())}** row(s) will NOT be pushed until their FACILITY is fixed "
+                         f"or its calendar is configured:")
+                bad = df.loc[~ok_s, ["EVENT_ID", "DATE", "SHOW", "FACILITY"]].assign(Problem=err_s[~ok_s])
+                bad["DATE"] = bad["DATE"].dt.strftime("%Y-%m-%d")
+                st.dataframe(bad, hide_index=True, use_container_width=True)
 
             col_test, _ = st.columns([1, 3])
             with col_test:
@@ -1026,16 +1086,21 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
 
                 stat.text("Reading shared calendar from Outlook...")
                 cal_maps = {m: build_calendar_map(token, m, df["DATE"].min(), df["DATE"].max())
-                            for m in set(mbx_of.values())}
+                            for m in set(mbx_s[ok_s])}
 
                 bar = st.progress(0)
-                for i, (_, row) in enumerate(df_push.iterrows()):
+                for i, (idx, row) in enumerate(df_push.iterrows()):
                     eid     = row["EVENT_ID"]
+                    if err_s[idx]:
+                        failed += 1
+                        results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Not pushed: {err_s[idx]}"})
+                        bar.progress((i + 1) / len(df_push))
+                        continue
                     subject = f"{row['SHOW']} - {row['FUNCTION']}"
                     end_dt  = row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"]
                     notes   = _event_notes(row)
                     fhash   = _field_hash(row)
-                    mbx     = mbx_of[row["BRANCH"]]
+                    mbx     = mbx_s[idx]
                     cal_map = cal_maps[mbx]
                     stat.text(f"Processing {i+1}/{len(df_push)}: {str(row['SHOW'])[:60]}...")
                     try:
@@ -1094,11 +1159,12 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                         results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Error: {e}"})
                     bar.progress((i + 1) / len(df_push))
 
-                # Delete Outlook events whose ID is no longer in the full Excel
-                # Keep IDs from the other SharePoint files so this file doesn't delete their events.
+                # Delete Outlook events whose ID is no longer in the full Excel, or whose row now goes
+                # to a different calendar. Keep IDs from the other SharePoint files so this file
+                # doesn't delete their events. excel_ids: {EVENT_ID: mailbox it routes to, or None}
                 del_ok = False
                 if not test_mode:
-                    excel_ids = set(df["EVENT_ID"])
+                    excel_ids = {}
                     try:
                         _, others, errs = _load_folder(token)
                         if errs:
@@ -1106,13 +1172,14 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                         else:
                             for name, d in others.items():
                                 if name != st.session_state.file_name:
-                                    excel_ids |= set(d["EVENT_ID"])
+                                    excel_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
+                            excel_ids.update(zip(df["EVENT_ID"], mbx_s))
                             del_ok = True
                     except Exception as e:
                         st.warning(f"Deletes skipped — could not read SharePoint folder: {e}")
                 if del_ok:
                     for eid, mbx, entry in ((e, m, x) for m, cm in cal_maps.items() for e, x in cm.items()):
-                        if eid not in excel_ids:
+                        if eid not in excel_ids or excel_ids[eid] not in (None, mbx):
                             stat.text(f"Deleting removed event: {eid}...")
                             try:
                                 dresp = delete_graph_event(token, mbx, entry["graph_id"])
@@ -1375,3 +1442,91 @@ elif "Crew" in page:
         st.info("Double-click the .ics file to import directly into Outlook.")
     else:
         st.info(f"No shifts found for **{selected}**.")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PAGE: OVERTIME / DOUBLE-TIME
+# ═══════════════════════════════════════════════════════════════════
+elif "Overtime" in page:
+    st.markdown('<div class="section-title">Overtime</div>', unsafe_allow_html=True)
+    st.caption(f"Source: **{st.session_state.file_name}** · rules and holidays are set in schedule_config.py")
+
+    ot_all = compute_overtime(df)  # on the whole file, so daily totals see every shift before filtering
+    if ot_all.empty:
+        st.info("No crew names or +N crew in this file, so there is nothing to count.")
+        st.stop()
+
+    # ── Filters ──────────────────────────────────────────────────────
+    f1, f2 = st.columns([2, 3])
+    with f1:
+        d_min, d_max = df["DATE"].min().date(), df["DATE"].max().date()
+        d_rng = st.date_input("Dates", (d_min, d_max), min_value=d_min, max_value=d_max, key="ot_dates")
+    with f2:
+        fac_opts = sorted(ot_all["FACILITY"].unique().tolist())
+        fac_sel  = st.multiselect("Facility", fac_opts, default=fac_opts, key="ot_fac",
+                                  format_func=lambda c: f"{c} - {FACILITIES[c]['name']}" if c in FACILITIES
+                                                        else (c or "(no facility)"))
+    d_from, d_to = (d_rng[0], d_rng[-1]) if d_rng else (d_min, d_max)
+    ot = ot_all[ot_all["DATE"].dt.date.between(d_from, d_to) & ot_all["FACILITY"].isin(fac_sel)]
+
+    n_norule = int((ot["STATUS"] == "no OT rules").sum())
+    n_notime = int((ot["STATUS"] == "no TIME").sum())
+    if n_norule:
+        st.warning(f"{n_norule} crew shift(s) are at facilities/branches with no OT rules configured yet; "
+                   f"their hours are counted as regular.")
+    if n_notime:
+        st.caption(f"{n_notime} crew shift(s) have no TIME, so their hours are unknown (counted as 0).")
+
+    t_team, t_ind, t_dt_team, t_dt_ind = st.tabs(
+        ["OT - Team", "OT - Individual", "Double-Time - Team", "Double-Time - Individual"])
+
+    with t_team:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Crew Shifts", len(ot))
+        c2.metric("Total Hours", f"{ot['HOURS'].sum():,.2f}")
+        c3.metric("OT Shifts",   int(ot["OT_SHIFT"].sum()))
+        c4.metric("OT Hours",    f"{ot['OT_HOURS'].sum():,.2f}")
+        st.markdown("**By electrician**")
+        st.dataframe(ot_summary(ot, "PERSON").round(2), hide_index=True, use_container_width=True)
+        st.caption("Unnamed crew = all +N slots combined; each is counted per shift (they can't be tracked "
+                   "across shifts).")
+        st.markdown("**By facility**")
+        st.dataframe(ot_summary(ot, "FACILITY").round(2), hide_index=True, use_container_width=True)
+        st.download_button("Export OT detail (.csv)", ot.to_csv(index=False).encode(),
+                           "ges_overtime.csv", "text/csv")
+
+    with t_ind:
+        names = sorted(ot.loc[ot["NAMED"], "PERSON"].unique().tolist())
+        if not names:
+            st.info("No named electricians match the filters.")
+        else:
+            who = st.selectbox("Select electrician", names, key="ot_person")
+            mine = ot[ot["PERSON"] == who]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Shifts",      len(mine))
+            c2.metric("Total Hours", f"{mine['HOURS'].sum():,.2f}")
+            c3.metric("OT Shifts",   int(mine["OT_SHIFT"].sum()))
+            c4.metric("OT Hours",    f"{mine['OT_HOURS'].sum():,.2f}")
+            d = mine[["DATE", "SHOW", "FACILITY", "FUNCTION", "TIME", "HOURS", "REG_HOURS", "OT_HOURS",
+                      "OT_REASON", "STATUS"]].copy()
+            d.insert(1, "DAY", d["DATE"].dt.strftime("%a"))
+            d["DATE"] = d["DATE"].dt.strftime("%Y-%m-%d")
+            st.dataframe(d.round(2), hide_index=True, use_container_width=True)
+
+    for tab in (t_dt_team, t_dt_ind):
+        with tab:
+            if not DT_RULES:
+                st.info("Double-Time rules have not been provided yet, so double-time is not calculated. "
+                        "This view will show double-time shifts and hours once the rules are added "
+                        "(DT_RULES in schedule_config.py).")
+
+    with st.expander("OT rules and holidays in use"):
+        for region, rules in OT_RULES.items():
+            facs = ", ".join(c for c, f in FACILITIES.items() if f["ot_region"] == region)
+            st.markdown(f"**{region}** ({facs}): over {rules['daily_hours']} hrs on a normal workday"
+                        + (", Saturday" if rules.get("saturday") else "")
+                        + (", Sunday" if rules.get("sunday") else "")
+                        + (", holidays" if rules.get("holidays") else "") + " = OT")
+            if rules.get("holidays"):
+                st.caption("Holidays: " + ", ".join(pd.to_datetime(HOLIDAYS.get(region, []))
+                                                    .strftime("%a %b %d, %Y")))
