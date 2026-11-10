@@ -643,7 +643,7 @@ if _graph_secrets_ok():
     _ensure_scheduler()
 
 # ─── SESSION STATE ───────────────────────────────────────────────────
-for _k, _v in [("df", None), ("file_name", None), ("notifs", None), ("ai_done", False)]:
+for _k, _v in [("df", None), ("file_name", None), ("notifs", None), ("ai_done", False), ("sp_item_id", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 # Re-assign every run so the nav radio keeps its page while hidden during Change File
@@ -664,7 +664,7 @@ with st.sidebar:
             f"({st.session_state.df['SCHEDULE_TYPE'].iloc[0]})"
         )
         if st.button("Change File", use_container_width=True):
-            for k in ("df", "file_name", "notifs"):
+            for k in ("df", "file_name", "notifs", "sp_item_id"):
                 st.session_state[k] = None
             st.session_state.ai_done = False
             st.rerun()
@@ -757,6 +757,7 @@ if st.session_state.df is None:
                 st.stop()
             st.session_state.df        = parsed
             st.session_state.file_name = sp_file["name"]
+            st.session_state.sp_item_id = sp_file["id"]
             st.session_state.notifs    = None
             st.session_state.ai_done   = False
             st.rerun()
@@ -805,6 +806,7 @@ if st.session_state.df is None:
         if st.button("Load Schedule", type="primary", use_container_width=True):
             st.session_state.df        = parsed
             st.session_state.file_name = file_label
+            st.session_state.sp_item_id = None
             st.session_state.notifs    = None
             st.session_state.ai_done   = False
             st.rerun()
@@ -1005,6 +1007,18 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                 except Exception as e:
                     st.error(f"Auth failed: {e}")
                     st.stop()
+
+                # A SharePoint file may have been moved or deleted since it was loaded
+                if st.session_state.sp_item_id:
+                    try:
+                        _, sp_now = get_sharepoint_files(token)
+                    except Exception as e:
+                        st.error(f"Could not check SharePoint: {e}")
+                        st.stop()
+                    if st.session_state.sp_item_id not in {f["id"] for f in sp_now}:
+                        st.error(f"**{st.session_state.file_name}** is no longer in the SharePoint "
+                                 f"folder, so nothing was pushed. Click Change File to load another file.")
+                        st.stop()
 
                 created = updated = failed = skipped = deleted = 0
                 results = []
