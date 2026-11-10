@@ -37,12 +37,14 @@ FACILITIES = {
 # ─── BRANCHES (ID PREFIXES) ──────────────────────────────────────────
 # ID prefix -> state and Outlook time zone. Each spreadsheet uses one prefix (LV-0001, ORL-0001, ...);
 # IDs must be unique across ALL spreadsheets, so every spreadsheet needs its own prefix.
+# The state decides the time zone, and a spreadsheet may only hold facilities in its own state
+# (state_code must match the facility's "state"); other rows are not pushed.
 # update_template.py adds any missing prefix to the BRANCH / STATE / TIME ZONE table on the Lists sheet.
 BRANCHES = {
-    "LV":   {"state": "Nevada",   "time_zone": "Pacific Standard Time"},   # Las Vegas
-    "ORL":  {"state": "Florida",  "time_zone": "Eastern Standard Time"},   # Orlando - Loews properties
-    "ORLM": {"state": "Florida",  "time_zone": "Eastern Standard Time"},   # Orlando - Marriott
-    "CHI":  {"state": "Illinois", "time_zone": "Central Standard Time"},   # Chicago
+    "LV":   {"state": "Nevada",   "state_code": "NV", "time_zone": "Pacific Standard Time"},   # Las Vegas
+    "ORL":  {"state": "Florida",  "state_code": "FL", "time_zone": "Eastern Standard Time"},   # Orlando - Loews
+    "ORLM": {"state": "Florida",  "state_code": "FL", "time_zone": "Eastern Standard Time"},   # Orlando - Marriott
+    "CHI":  {"state": "Illinois", "state_code": "IL", "time_zone": "Central Standard Time"},   # Chicago
 }
 
 # ─── OUTLOOK CALENDARS ───────────────────────────────────────────────

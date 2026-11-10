@@ -5,18 +5,24 @@ All facility / calendar / rule data comes from schedule_config.py.
 """
 import re
 import pandas as pd
-from schedule_config import FACILITIES, CALENDARS, OT_RULES, HOLIDAYS
+from schedule_config import FACILITIES, CALENDARS, OT_RULES, HOLIDAYS, BRANCHES
 
 # ─── FACILITY ROUTING ────────────────────────────────────────────────
-def facility_route(facility, calendar_mailboxes):
+def facility_route(facility, calendar_mailboxes, branch=""):
     """(mailbox, '') for a row's facility, or (None, reason) when it can't be routed.
-    calendar_mailboxes: {CALENDAR KEY: mailbox} from the GRAPH_CALENDAR_MAILBOXES setting."""
+    calendar_mailboxes: {CALENDAR KEY: mailbox} from the GRAPH_CALENDAR_MAILBOXES setting.
+    branch: the row's ID prefix; a facility in another state than the branch is rejected
+    (the branch's state decides the time zone)."""
     code = str(facility or "").strip().upper()
     if not code:
         return None, "FACILITY is blank"
     fac = FACILITIES.get(code)
     if fac is None:
         return None, f"'{code}' is not a known facility code"
+    b = BRANCHES.get(str(branch or "").upper())
+    if b and fac["state"] and fac["state"] != b["state_code"]:
+        return None, (f"{code} is in {fac['state']}, but this {str(branch).upper()} spreadsheet is for "
+                      f"{b['state']}; move the row to the {fac['state']} spreadsheet")
     if not fac["calendar"]:
         return None, f"no Outlook calendar is configured for {code} yet"
     mailbox = calendar_mailboxes.get(fac["calendar"])

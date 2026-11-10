@@ -71,6 +71,14 @@ class FacilityRouting(unittest.TestCase):
         self.assertEqual([facility_route(c, mbx)[0] for c in ("HARROC", "MARWCR", "HILLV", "SHECHI")],
                          ["loews@x.com", "orl@x.com", "lv@x.com", "chi@x.com"])
 
+    def test_state_check_uses_branch(self):
+        mbx = {"LOEWS_ELECTRICAL": "loews@x.com", "LV_ELECTRICAL": "lv@x.com"}
+        self.assertEqual(facility_route("HARROC", mbx, "ORL"), ("loews@x.com", ""))
+        self.assertEqual(facility_route("HILLV", mbx, "LV"), ("lv@x.com", ""))
+        self.assertIsNone(facility_route("HARROC", mbx, "LV")[0])
+        self.assertIsNone(facility_route("SHECHI", mbx, "ORLM")[0])
+        self.assertEqual(facility_route("HARROC", mbx, ""), ("loews@x.com", ""))  # no prefix: can't check state
+
     def test_calendar_without_mailbox_setting_is_rejected(self):
         mbx, err = facility_route("HARROC", {})
         self.assertIsNone(mbx)
@@ -93,10 +101,20 @@ class AppRouteRows(unittest.TestCase):
 
     def test_mixed_facilities_in_one_file(self):
         df = pd.DataFrame([{"FACILITY": "HARROC", "BRANCH": "ORL"}, {"FACILITY": "SHECHI", "BRANCH": "ORL"},
-                           {"FACILITY": "XYZ", "BRANCH": "ORL"}, {"FACILITY": "LSAPP", "BRANCH": "LV"}])
+                           {"FACILITY": "XYZ", "BRANCH": "ORL"}, {"FACILITY": "LSAPP", "BRANCH": "ORL"}])
         mbx, err = self.ns["_route_rows"](df)
         self.assertEqual(list(mbx), ["loews@x.com", None, None, "loews@x.com"])
         self.assertEqual([bool(e) for e in err], [False, True, True, False])
+
+    def test_facility_from_another_state_is_rejected(self):
+        df = pd.DataFrame([{"FACILITY": "HARROC", "BRANCH": "LV"},    # Florida facility in the LV sheet
+                           {"FACILITY": "HILLV", "BRANCH": "ORL"},    # Nevada facility in the ORL sheet
+                           {"FACILITY": "MARWCR", "BRANCH": "ORLM"}])  # Florida in a Florida sheet: OK
+        mbx, err = self.ns["_route_rows"](df)
+        self.assertEqual(list(mbx)[:2], [None, None])
+        self.assertIn("HARROC is in FL, but this LV spreadsheet is for Nevada", err[0])
+        self.assertIn("HILLV is in NV", err[1])
+        self.assertNotIn("spreadsheet is for", err[2])  # same state: no state error
 
     def test_blank_facility_goes_to_listed_city_calendar_only(self):
         df = pd.DataFrame([{"FACILITY": "", "BRANCH": "ORL"},   # ORL listed -> city calendar

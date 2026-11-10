@@ -222,7 +222,7 @@ def _route_rows(df):
         if not has_facility(r["FACILITY"]):
             return _mailbox_for(r["BRANCH"]), ""
         if r["FACILITY"]:
-            return facility_route(r["FACILITY"], cal_mbx)
+            return facility_route(r["FACILITY"], cal_mbx, r["BRANCH"])
         branch = str(r["BRANCH"] or "").upper()
         if branch in branch_mbx:
             return branch_mbx[branch], ""
