@@ -26,12 +26,23 @@ FACILITIES = {
                "excel_color": "FFB366", "calendar": "LOEWS_ELECTRICAL", "ot_region": "ORL"},   # orange
     "LSAPP":  {"name": "Sapphire Falls",  "city": "Orlando", "state": "FL",
                "excel_color": "99CCFF", "calendar": "LOEWS_ELECTRICAL", "ot_region": "ORL"},   # blue
-    "MARWCR": {"name": "Marriott",        "city": None,      "state": None,
-               "excel_color": None,     "calendar": None,               "ot_region": None},    # TBD
+    "MARWCR": {"name": "Marriott",        "city": "Orlando", "state": "FL",
+               "excel_color": None,     "calendar": None,               "ot_region": "ORL"},   # calendar TBD
     "HILLV":  {"name": "Westgate Las Vegas Resort & Casino", "city": "Las Vegas", "state": "NV",
                "excel_color": None,     "calendar": None,               "ot_region": None},    # TBD
     "SHECHI": {"name": "Sheraton Grand Chicago",             "city": "Chicago",   "state": "IL",
                "excel_color": None,     "calendar": None,               "ot_region": None},    # TBD
+}
+
+# ─── BRANCHES (ID PREFIXES) ──────────────────────────────────────────
+# ID prefix -> state and Outlook time zone. Each spreadsheet uses one prefix (LV-0001, ORL-0001, ...);
+# IDs must be unique across ALL spreadsheets, so every spreadsheet needs its own prefix.
+# update_template.py adds any missing prefix to the BRANCH / STATE / TIME ZONE table on the Lists sheet.
+BRANCHES = {
+    "LV":   {"state": "Nevada",   "time_zone": "Pacific Standard Time"},   # Las Vegas
+    "ORL":  {"state": "Florida",  "time_zone": "Eastern Standard Time"},   # Orlando - Loews properties
+    "ORLM": {"state": "Florida",  "time_zone": "Eastern Standard Time"},   # Orlando - Marriott
+    "CHI":  {"state": "Illinois", "time_zone": "Central Standard Time"},   # Chicago
 }
 
 # ─── OUTLOOK CALENDARS ───────────────────────────────────────────────

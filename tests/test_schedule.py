@@ -59,7 +59,7 @@ class FacilityRouting(unittest.TestCase):
 
     def test_blank_unknown_unmapped_are_rejected(self):
         for code, msg in [("", "blank"), (None, "blank"), ("XYZ", "not a known facility"),
-                          ("MARWCR", "no Outlook calendar"), ("HILLV", "no Outlook calendar"),
+                          ("MARWCR", "no Outlook calendar"), ("HILLV", "no Outlook calendar"),  # calendars TBD
                           ("SHECHI", "no Outlook calendar")]:
             mbx, err = facility_route(code, self.MBX)
             self.assertIsNone(mbx, code)
@@ -132,6 +132,18 @@ class Parser(unittest.TestCase):
         self.assertEqual(df.loc[2, "EXTRA_CREW"], 2)          # LV-0003 has '+2'
         self.assertTrue(df.loc[0, "LINK"].startswith("https://"))  # hyperlink still read after the column insert
 
+    def test_marriott_and_chicago_prefixes_get_their_time_zones(self):
+        path = self.tmp / "t2.xlsx"
+        shutil.copy(TEMPLATE, path)
+        wb = load_workbook(path)
+        ws = wb["By Day"]
+        ws["A2"], ws["G2"] = "ORLM-0001", "MARWCR"
+        ws["A3"], ws["G3"] = "CHI-0001", "SHECHI"
+        wb.save(path)
+        df = self.ns["parse_lv_byDay"](str(path), "By Day").set_index("EVENT_ID")
+        self.assertEqual(df.loc["ORLM-0001", "TIME_ZONE"], "Eastern Standard Time")
+        self.assertEqual(df.loc["CHI-0001", "TIME_ZONE"], "Central Standard Time")
+
     @unittest.skipUnless(OLD_TEMPLATE.exists(), "v1.0 template backup not present")
     def test_old_template_without_facility_column(self):
         df = self.ns["parse_lv_byDay"](str(OLD_TEMPLATE), "By Day")
@@ -200,6 +212,10 @@ class Overtime(unittest.TestCase):
         finally:
             schedule_logic.HOLIDAYS = orig
         self.assertEqual((r.OT_HOURS, r.OT_REASON), (10.0, "Holiday"))
+
+    def test_marriott_uses_orlando_rules(self):
+        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="MARWCR")]).iloc[0]
+        self.assertEqual((r.OT_HOURS, r.OT_REASON), (10.0, "Saturday"))
 
     def test_no_rules_region(self):
         r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="SHECHI")]).iloc[0]

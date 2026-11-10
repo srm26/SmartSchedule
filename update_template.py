@@ -16,7 +16,7 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
-from schedule_config import FACILITIES
+from schedule_config import FACILITIES, BRANCHES
 
 DEFAULT_PATH = r"templates\GES Electrical Show Schedule TEMPLATE.xlsx"
 FAC_HEADER   = "FACILITY"
@@ -55,6 +55,18 @@ def _write_lists(lists):
             lists.cell(r, LISTS_COL + c, val)
     lists.column_dimensions[get_column_letter(LISTS_COL)].width = 15
     lists.column_dimensions[get_column_letter(LISTS_COL + 1)].width = 36
+
+def _add_branches(lists):
+    """Add BRANCHES missing from the BRANCH / STATE / TIME ZONE table (Lists C:E); existing rows are kept."""
+    have = {str(lists.cell(r, 3).value).strip().upper() for r in range(2, LISTS_ROWS + 2) if lists.cell(r, 3).value}
+    row = 2
+    for code, b in BRANCHES.items():
+        if code in have:
+            continue
+        while lists.cell(row, 3).value:
+            row += 1
+        for c, val in enumerate([code, b["state"], b["time_zone"]]):
+            lists.cell(row, 3 + c, val)._style = copy(lists.cell(2, 3 + c)._style)
 
 def _set_validations(ws, fac_col, last_row):
     """Re-create the FUNCTION / LOCATION / FACILITY dropdowns. openpyxl can't keep the template's
@@ -121,6 +133,7 @@ def main(path):
     ws.cell(1, fac_col)._style = copy(ws.cell(1, _header(ws).index(INSERT_AT) + 1)._style)
     last_row = ws.max_row
     _write_lists(wb["Lists"])
+    _add_branches(wb["Lists"])
     _set_validations(ws, fac_col, last_row)
     _set_row_colors(ws, fac_col, last_row)
     _update_instructions(wb["Instructions"])
