@@ -59,11 +59,17 @@ class FacilityRouting(unittest.TestCase):
 
     def test_blank_unknown_unmapped_are_rejected(self):
         for code, msg in [("", "blank"), (None, "blank"), ("XYZ", "not a known facility"),
-                          ("MARWCR", "no Outlook calendar"), ("HILLV", "no Outlook calendar"),  # calendars TBD
-                          ("SHECHI", "no Outlook calendar")]:
+                          ("MARWCR", "no mailbox set"), ("HILLV", "no mailbox set"),
+                          ("SHECHI", "no mailbox set")]:
             mbx, err = facility_route(code, self.MBX)
             self.assertIsNone(mbx, code)
             self.assertIn(msg, err)
+
+    def test_each_facility_routes_to_its_calendar_mailbox(self):
+        mbx = {"LOEWS_ELECTRICAL": "loews@x.com", "ORL_MARRIOTT": "orl@x.com",
+               "LV_ELECTRICAL": "lv@x.com", "CHI_ELECTRICAL": "chi@x.com"}
+        self.assertEqual([facility_route(c, mbx)[0] for c in ("HARROC", "MARWCR", "HILLV", "SHECHI")],
+                         ["loews@x.com", "orl@x.com", "lv@x.com", "chi@x.com"])
 
     def test_calendar_without_mailbox_setting_is_rejected(self):
         mbx, err = facility_route("HARROC", {})

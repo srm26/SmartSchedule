@@ -27,11 +27,11 @@ FACILITIES = {
     "LSAPP":  {"name": "Sapphire Falls",  "city": "Orlando", "state": "FL",
                "excel_color": "99CCFF", "calendar": "LOEWS_ELECTRICAL", "ot_region": "ORL"},   # blue
     "MARWCR": {"name": "Marriott",        "city": "Orlando", "state": "FL",
-               "excel_color": None,     "calendar": None,               "ot_region": "ORL"},   # calendar TBD
+               "excel_color": None,     "calendar": "ORL_MARRIOTT",     "ot_region": "ORL"},
     "HILLV":  {"name": "Westgate Las Vegas Resort & Casino", "city": "Las Vegas", "state": "NV",
-               "excel_color": None,     "calendar": None,               "ot_region": None},    # TBD
+               "excel_color": None,     "calendar": "LV_ELECTRICAL",    "ot_region": None},    # OT rules TBD
     "SHECHI": {"name": "Sheraton Grand Chicago",             "city": "Chicago",   "state": "IL",
-               "excel_color": None,     "calendar": None,               "ot_region": None},    # TBD
+               "excel_color": None,     "calendar": "CHI_ELECTRICAL",   "ot_region": None},    # OT rules TBD
 }
 
 # ─── BRANCHES (ID PREFIXES) ──────────────────────────────────────────
@@ -52,6 +52,9 @@ BRANCHES = {
 # A calendar without a mailbox setting is treated as unmapped: its rows are not pushed.
 CALENDARS = {
     "LOEWS_ELECTRICAL": "Loews Electrical",
+    "ORL_MARRIOTT":     "Orlando Marriott",      # may share the ORL calendar: point it at the same mailbox
+    "LV_ELECTRICAL":    "Las Vegas Electrical",
+    "CHI_ELECTRICAL":   "Chicago Electrical",
 }
 
 # ─── OUTLOOK EVENT COLORS ────────────────────────────────────────────
