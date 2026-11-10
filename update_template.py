@@ -39,8 +39,7 @@ def _insert_facility_column(ws):
         for cell in row:
             if cell.hyperlink is not None:
                 cell.hyperlink.ref = cell.coordinate
-    head = ws.cell(1, col, FAC_HEADER)
-    head._style = copy(ws["A1"]._style)      # same look as the other required (red) headers
+    ws.cell(1, col, FAC_HEADER)
     return col
 
 def _write_lists(lists):
@@ -90,11 +89,17 @@ def _set_row_colors(ws, fac_col, last_row):
             fill = PatternFill(start_color=f["excel_color"], end_color=f["excel_color"], fill_type="solid")
             ws.conditional_formatting.add(rng, FormulaRule(formula=[f'${letter}2="{code}"'], fill=fill))
 
+FAC_HELP = ("FACILITY - pick the facility code from the dropdown (list is on the 'Lists' sheet). It picks "
+            "the Outlook calendar and colours the row. Leave it blank only if your city has no facilities: "
+            "the row then goes to your city's calendar (from the ID prefix). If your city has no calendar "
+            "set up, the row is not pushed to Outlook.")
+
 def _update_instructions(ws):
-    """Document the FACILITY column on the Instructions sheet (only once)."""
-    texts = [c.value or "" for c in ws["A"]]
-    if any(str(t).startswith("FACILITY (required)") for t in texts):
-        return
+    """Document the FACILITY column on the Instructions sheet (added once, text refreshed every run)."""
+    for c in ws["A"]:
+        if str(c.value or "").startswith(("FACILITY (", "FACILITY - ")):
+            c.value = FAC_HELP
+            return
     ws["A1"] = str(ws["A1"].value).replace("(v1.0)", "(v1.1)")
     for c in ws["A"]:
         if str(c.value or "").startswith("5. To cancel a shift"):
@@ -103,9 +108,7 @@ def _update_instructions(ws):
         if str(c.value or "").startswith("FUNCTION (required)"):
             r = c.row + 1
             ws.insert_rows(r)
-            ws.cell(r, 1, "FACILITY (required) - pick the facility code from the dropdown (list is on the "
-                          "'Lists' sheet). It picks the Outlook calendar and colours the row. "
-                          "Rows with a blank FACILITY are not pushed to Outlook.")
+            ws.cell(r, 1, FAC_HELP)
             ws.cell(r, 1)._style = copy(c._style)
             break
 
@@ -114,6 +117,8 @@ def main(path):
     ws = wb["By Day"]
     h = _header(ws)
     fac_col = h.index(FAC_HEADER) + 1 if FAC_HEADER in h else _insert_facility_column(ws)
+    # Optional column (blank = city calendar), so it looks like LOCATION, not the red required headers
+    ws.cell(1, fac_col)._style = copy(ws.cell(1, _header(ws).index(INSERT_AT) + 1)._style)
     last_row = ws.max_row
     _write_lists(wb["Lists"])
     _set_validations(ws, fac_col, last_row)

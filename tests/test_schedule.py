@@ -87,10 +87,21 @@ class AppRouteRows(unittest.TestCase):
 
     def test_mixed_facilities_in_one_file(self):
         df = pd.DataFrame([{"FACILITY": "HARROC", "BRANCH": "ORL"}, {"FACILITY": "SHECHI", "BRANCH": "ORL"},
-                           {"FACILITY": "", "BRANCH": "ORL"}, {"FACILITY": "LSAPP", "BRANCH": "LV"}])
+                           {"FACILITY": "XYZ", "BRANCH": "ORL"}, {"FACILITY": "LSAPP", "BRANCH": "LV"}])
         mbx, err = self.ns["_route_rows"](df)
         self.assertEqual(list(mbx), ["loews@x.com", None, None, "loews@x.com"])
         self.assertEqual([bool(e) for e in err], [False, True, True, False])
+
+    def test_blank_facility_goes_to_listed_city_calendar_only(self):
+        df = pd.DataFrame([{"FACILITY": "", "BRANCH": "ORL"},   # ORL listed -> city calendar
+                           {"FACILITY": "", "BRANCH": "LV"},    # LV not listed -> exception, NOT default mailbox
+                           {"FACILITY": "", "BRANCH": ""}])     # no prefix -> exception
+        mbx, err = self.ns["_route_rows"](df)
+        self.assertEqual(list(mbx), ["orl@x.com", None, None])
+        self.assertEqual(err[0], "")
+        self.assertIn("branch LV has no city calendar", err[1])
+        self.assertIn("no branch prefix", err[2])
+        self.assertNotIn("default@x.com", list(mbx))
 
     def test_file_without_facility_column_keeps_branch_routing(self):
         df = pd.DataFrame([{"FACILITY": None, "BRANCH": "ORL"}, {"FACILITY": None, "BRANCH": "LV"}])
@@ -193,6 +204,10 @@ class Overtime(unittest.TestCase):
     def test_no_rules_region(self):
         r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="SHECHI")]).iloc[0]
         self.assertEqual((r.OT_HOURS, r.STATUS), (0.0, "no OT rules"))
+
+    def test_blank_facility_uses_branch_rules(self):
+        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="", branch="ORL")]).iloc[0]
+        self.assertEqual((r.OT_HOURS, r.OT_REASON), (10.0, "Saturday"))
 
     def test_legacy_file_uses_branch(self):
         r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility=None, branch="ORL")]).iloc[0]

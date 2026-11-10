@@ -45,9 +45,9 @@ def shift_span(time_str):
     return start, (end - start) / 60
 
 def _ot_region(row):
-    """Rules region for a row: from its facility, or from the ID prefix for files without a FACILITY column."""
+    """Rules region for a row: from its facility, or from the ID prefix when FACILITY is blank or absent."""
     fac = row.get("FACILITY")
-    if has_facility(fac):
+    if has_facility(fac) and fac:
         return FACILITIES.get(str(fac), {}).get("ot_region")
     return row.get("BRANCH") or None
 

@@ -181,12 +181,25 @@ def _mailbox_for(branch):
 
 def _route_rows(df):
     """(mailbox, error) per row. Rows with a FACILITY go to that facility's calendar (schedule_config.py +
-    GRAPH_CALENDAR_MAILBOXES); a blank, unknown or unmapped facility gets an error and is not pushed.
+    GRAPH_CALENDAR_MAILBOXES); an unknown or unmapped facility gets an error and is not pushed.
+    A blank FACILITY (cities without facilities) goes to the city's calendar from the ID prefix, only if
+    that branch is listed in GRAPH_BRANCH_MAILBOXES; otherwise it's an error too.
     Files without a FACILITY column keep the older routing by ID prefix (_mailbox_for)."""
-    cal_mbx = _mailbox_setting("GRAPH_CALENDAR_MAILBOXES", "calendar_mailboxes")
-    routes = [facility_route(r["FACILITY"], cal_mbx) if has_facility(r["FACILITY"])
-              else (_mailbox_for(r["BRANCH"]), "")
-              for _, r in df.iterrows()]
+    cal_mbx    = _mailbox_setting("GRAPH_CALENDAR_MAILBOXES", "calendar_mailboxes")
+    branch_mbx = _mailbox_setting("GRAPH_BRANCH_MAILBOXES", "branch_mailboxes")
+
+    def route(r):
+        if not has_facility(r["FACILITY"]):
+            return _mailbox_for(r["BRANCH"]), ""
+        if r["FACILITY"]:
+            return facility_route(r["FACILITY"], cal_mbx)
+        branch = str(r["BRANCH"] or "").upper()
+        if branch in branch_mbx:
+            return branch_mbx[branch], ""
+        return None, ("FACILITY is blank and " + (f"branch {branch} has no city calendar" if branch
+                      else "the ID has no branch prefix") + " in GRAPH_BRANCH_MAILBOXES")
+
+    routes = [route(r) for _, r in df.iterrows()]
     return (pd.Series([m for m, _ in routes], index=df.index, dtype=object),
             pd.Series([e for _, e in routes], index=df.index, dtype=object))
 
@@ -1013,12 +1026,13 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
             if not has_facility(df["FACILITY"].iloc[0]):
                 st.warning(f"This file has no **{FACILITY_COL}** column, so rows are routed by ID prefix "
                            f"(older format). Move the rows to the current template to route by facility.")
-                key_col = "BRANCH"
-            else:
-                key_col = "FACILITY"
+                label = df["BRANCH"].replace("", "no prefix")
+            else:  # blank FACILITY rows go by city: show them as e.g. 'ORL (no facility)'
+                label = df["FACILITY"].where(df["FACILITY"] != "",
+                                             df["BRANCH"].replace("", "no prefix") + " (no facility)")
             if ok_s.any():
-                dest = df[ok_s].groupby(mbx_s[ok_s])[key_col].unique()
-                st.info("Pushing to: " + "; ".join(f"**{', '.join(sorted(k or 'no prefix' for k in ks))}** → {m}"
+                dest = label[ok_s].groupby(mbx_s[ok_s]).unique()
+                st.info("Pushing to: " + "; ".join(f"**{', '.join(sorted(ks))}** → {m}"
                                                    for m, ks in dest.items()))
             if not ok_s.all():
                 st.error(f"**{int((~ok_s).sum())}** row(s) will NOT be pushed until their FACILITY is fixed "
