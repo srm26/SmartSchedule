@@ -564,7 +564,7 @@ def _get_sweep_status():
 
 @st.cache_resource
 def _get_sweep_config():
-    return {"test_rows": 2}
+    return {"test_rows": 0}  # off after every restart, so business edits sync in full
 
 def _load_sweep_state():
     try:
@@ -592,13 +592,47 @@ def _load_folder(token):
             errors[f["name"]] = str(e)
     return sp_files, parsed, errors
 
-def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
-    """Run create/update sync for one parsed dataframe. Returns stats dict.
-    keep_ids: {EVENT_ID: mailbox the row now routes to (None if it can't be routed)}.
-    Deletes Outlook events in the date range whose ID is not in keep_ids, or whose row now routes to a
-    different mailbox (facility changed); pass keep_ids=None to skip deletes (test mode)."""
+DELETE_DAYS_AHEAD = 548  # removed shifts are deleted from today through about 18 months ahead
+
+def _all_calendar_mailboxes():
+    """Every calendar the app can push to (facility calendars, city calendars, default shared mailbox)."""
+    return ({*_mailbox_setting("GRAPH_CALENDAR_MAILBOXES", "calendar_mailboxes").values(),
+             *_mailbox_setting("GRAPH_BRANCH_MAILBOXES", "branch_mailboxes").values(),
+             _graph_cfg().get("shared_mailbox")} - {None, ""})
+
+def _delete_removed(token, keep_ids, mailboxes):
+    """Delete app events, from today on, in every calendar, whose ID is in no schedule file, or whose row now
+    routes to a different calendar (facility changed). keep_ids: {EVENT_ID: mailbox it routes to, or None}.
+    One mailbox can be listed under two addresses; it returns the same event id under both, so an event seen
+    under its row's address is not 'moved'. Returns [(EVENT_ID, mailbox, deleted_ok)]."""
+    start = pd.Timestamp(dt.now(_PT).date())
+    end   = start + timedelta(days=DELETE_DAYS_AHEAD)
+    maps  = {m: build_calendar_map(token, m, start, end) for m in sorted(mailboxes)}
+    done, gone = [], set()
+    for mbx, cal_map in maps.items():
+        for eid, entry in cal_map.items():
+            if eid in keep_ids:
+                target = keep_ids[eid]
+                if target in (None, mbx):
+                    continue
+                if maps.get(target, {}).get(eid, {}).get("graph_id") == entry["graph_id"]:
+                    continue  # same mailbox under its other address
+            if entry["graph_id"] in gone:
+                continue      # already deleted through the mailbox's other address
+            try:
+                ok = delete_graph_event(token, mbx, entry["graph_id"]).status_code in (200, 204)
+            except Exception:
+                ok = False
+            if ok:
+                gone.add(entry["graph_id"])
+            done.append((eid, mbx, ok))
+    return done
+
+def _sync_dataframe(token, mailbox, df_file):
+    """Run create/update sync for one parsed dataframe. Returns stats dict. Deletes are done separately
+    for the whole folder by _delete_removed."""
     cal_map = build_calendar_map(token, mailbox, df_file["DATE"].min(), df_file["DATE"].max())
-    created = updated = deleted = skipped = failed = 0
+    created = updated = skipped = failed = 0
     for _, row in df_file.iterrows():
         eid     = row["EVENT_ID"]
         subject = f"{row['SHOW']} - {row['FUNCTION']}"
@@ -639,15 +673,7 @@ def _sync_dataframe(token, mailbox, df_file, keep_ids=None):
         except Exception:
             failed += 1
 
-    if keep_ids is not None:
-        for eid, entry in cal_map.items():
-            if eid not in keep_ids or keep_ids[eid] not in (None, mailbox):
-                dresp = delete_graph_event(token, mailbox, entry["graph_id"])
-                if dresp.status_code in (200, 204):
-                    deleted += 1
-
-    return {"created": created, "updated": updated, "deleted": deleted,
-            "skipped": skipped, "failed": failed}
+    return {"created": created, "updated": updated, "skipped": skipped, "failed": failed}
 
 def run_sweep():
     status = _get_sweep_status()
@@ -660,16 +686,6 @@ def run_sweep():
         sp_files, parsed, errors = _load_folder(token)
         state    = _load_sweep_state()
         limit    = config.get("test_rows", 0)
-
-        # IDs from every file in the folder, so one file never deletes another's events.
-        # If any file failed to parse, skip deletes rather than risk removing its events.
-        keep_ids = None
-        if limit == 0 and not errors:
-            keep_ids = {}
-            for d in parsed.values():
-                keep_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
-        elif limit == 0:
-            log.append("⚠️ Deletes skipped — could not read: " + ", ".join(errors))
 
         log += [f"⚠️ {w}" for w in CONFIG_WARNINGS]  # facility / branch / OT settings that couldn't be read
         cat_checked = set()  # mailboxes whose Outlook categories (event colors) were checked this sweep
@@ -690,16 +706,16 @@ def run_sweep():
                 # Each row goes to its facility's calendar; rows that can't be routed are not pushed
                 mbx_s, err_s = _route_rows(df_f)
                 ok     = err_s == ""
-                stats  = {"created": 0, "updated": 0, "deleted": 0, "skipped": 0, "failed": 0}
+                stats  = {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
                 for mbx, grp in df_f[ok].groupby(mbx_s[ok]):
                     if mbx not in cat_checked:
                         cat_checked.add(mbx)
                         if (cat_err := ensure_outlook_categories(token, mbx)):
                             log.append(f"⚠️ Event colors: {cat_err}")
-                    for k, v in _sync_dataframe(token, mbx, grp, keep_ids).items():
+                    for k, v in _sync_dataframe(token, mbx, grp).items():
                         stats[k] += v
                 result = (f"Created:{stats['created']} Updated:{stats['updated']} "
-                          f"Deleted:{stats['deleted']} Skipped:{stats['skipped']} Failed:{stats['failed']}")
+                          f"Skipped:{stats['skipped']} Failed:{stats['failed']}")
                 if not ok.all():
                     bad = [f"{e}: {m}" for e, m in zip(df_f.loc[~ok, "EVENT_ID"], err_s[~ok])]
                     result += f" Not pushed:{len(bad)} ({'; '.join(bad[:3])}{'; ...' if len(bad) > 3 else ''})"
@@ -712,6 +728,26 @@ def run_sweep():
                 log.append(f"❌ {fname} — Error: {e}")
 
         _save_sweep_state(state)
+
+        # Every sweep, remove calendar events whose shift is no longer in any file in the folder
+        # (also covers a whole file removed). Uses the full files, even in sweep test mode.
+        if errors:  # an unreadable file's events would look removed
+            status["error"] = ("Deleted shifts were NOT removed from Outlook — could not read: "
+                               + ", ".join(errors) + ". Fix or remove that file.")
+        elif not parsed:  # empty listing: don't wipe every calendar on a SharePoint hiccup
+            log.append("⚠️ No schedule files in the folder — removed-shift check skipped.")
+        else:
+            keep_ids = {}
+            for d in parsed.values():
+                keep_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
+            removed = _delete_removed(token, keep_ids, _all_calendar_mailboxes())
+            if removed:
+                ok_ids  = [e for e, _, ok in removed if ok]
+                bad_ids = [e for e, _, ok in removed if not ok]
+                log.append(f"🗑️ Removed {len(ok_ids)} event(s) no longer in Excel"
+                           + (f": {', '.join(ok_ids[:10])}{' ...' if len(ok_ids) > 10 else ''}" if ok_ids else ""))
+                if bad_ids:
+                    status["error"] = f"Could not delete {len(bad_ids)} removed event(s): {', '.join(bad_ids[:10])}"
     except Exception as e:
         status["error"] = str(e)
         log.append(f"❌ Sweep error: {e}")
@@ -1115,6 +1151,10 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
 
             if test_mode:
                 st.caption(f"Test mode: will push **{int(test_n)}** of {len(df)} events.")
+            if not st.session_state.sp_item_id:
+                st.warning("This file was uploaded from your computer. Auto-sync treats the SharePoint folder as "
+                           "the master list, so its events will be removed at the next sync (within 15 minutes). "
+                           "Save the file to the SharePoint folder to keep them on the calendar.")
 
             if st.button("Push to Shared Calendar", type="primary", use_container_width=True):
                 try:
@@ -1217,35 +1257,30 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
                         results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Error: {e}"})
                     bar.progress((i + 1) / len(df_push))
 
-                # Delete Outlook events whose ID is no longer in the full Excel, or whose row now goes
-                # to a different calendar. Keep IDs from the other SharePoint files so this file
-                # doesn't delete their events. excel_ids: {EVENT_ID: mailbox it routes to, or None}
-                del_ok = False
-                if not test_mode:
-                    excel_ids = {}
-                    try:
-                        _, others, errs = _load_folder(token)
-                        if errs:
-                            st.warning("Deletes skipped — could not read: " + ", ".join(errs))
+                # Delete Outlook events (today on, every calendar) whose ID is no longer in this full Excel or
+                # any other SharePoint file, or whose row now goes to a different calendar. Runs in test mode
+                # too: removing a shift that is gone from Excel is always right.
+                excel_ids = {}  # {EVENT_ID: mailbox it routes to, or None}
+                try:
+                    _, others, errs = _load_folder(token)
+                except Exception as e:
+                    others, errs = {}, {"SharePoint folder": str(e)}
+                if errs:
+                    st.error("Deleted shifts were NOT removed from Outlook — could not read: "
+                             + ", ".join(errs) + ". Fix or remove that file, then push again.")
+                else:
+                    for name, d in others.items():
+                        if name != st.session_state.file_name:
+                            excel_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
+                    excel_ids.update(zip(df["EVENT_ID"], mbx_s))
+                    stat.text("Removing shifts that are no longer in Excel...")
+                    for eid, _, ok in _delete_removed(token, excel_ids, _all_calendar_mailboxes()):
+                        if ok:
+                            deleted += 1
+                            results.append({"ID": eid, "Event": "—", "Status": "Deleted (removed from Excel)"})
                         else:
-                            for name, d in others.items():
-                                if name != st.session_state.file_name:
-                                    excel_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
-                            excel_ids.update(zip(df["EVENT_ID"], mbx_s))
-                            del_ok = True
-                    except Exception as e:
-                        st.warning(f"Deletes skipped — could not read SharePoint folder: {e}")
-                if del_ok:
-                    for eid, mbx, entry in ((e, m, x) for m, cm in cal_maps.items() for e, x in cm.items()):
-                        if eid not in excel_ids or excel_ids[eid] not in (None, mbx):
-                            stat.text(f"Deleting removed event: {eid}...")
-                            try:
-                                dresp = delete_graph_event(token, mbx, entry["graph_id"])
-                                if dresp.status_code in (204, 200):
-                                    deleted += 1
-                                    results.append({"ID": eid, "Event": "—", "Status": "Deleted (removed from Excel)"})
-                            except Exception as e:
-                                results.append({"ID": eid, "Event": "—", "Status": f"Delete error: {e}"})
+                            failed += 1
+                            results.append({"ID": eid, "Event": "—", "Status": "Delete failed"})
 
                 stat.empty()
                 c1, c2, c3, c4, c5 = st.columns(5)

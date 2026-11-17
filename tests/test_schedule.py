@@ -332,6 +332,74 @@ class OutlookColors(unittest.TestCase):
         self.assertIn("STRIKE (red)", err)
 
 
+class RemovedShifts(unittest.TestCase):
+    """_delete_removed: a shift deleted from Excel leaves Outlook, wherever it is on the calendar."""
+
+    def setUp(self):
+        import types
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        self.cal, self.queried, self.deleted = {}, [], []
+
+        def fake_map(token, mbx, start, end):
+            self.queried.append((mbx, start, end))
+            return {e: dict(x) for e, x in self.cal.get(mbx, {}).items()}
+
+        def fake_delete(token, mbx, gid):
+            self.deleted.append((mbx, gid))
+            return types.SimpleNamespace(status_code=204)
+
+        self.ns = _load_app_functions(
+            {"_delete_removed", "_all_calendar_mailboxes", "_mailbox_setting"},
+            {"build_calendar_map": fake_map, "delete_graph_event": fake_delete, "dt": datetime,
+             "timedelta": timedelta, "_PT": ZoneInfo("America/Los_Angeles"),
+             "_graph_cfg": lambda: {"shared_mailbox": "default@x.com"}})
+
+    def run_delete(self, keep, mailboxes=("a@x.com", "b@x.com")):
+        return self.ns["_delete_removed"]("t", keep, set(mailboxes))
+
+    def test_removed_row_deleted_kept_row_stays(self):
+        self.cal = {"a@x.com": {"LV-1": {"graph_id": "g1", "hash": ""}, "LV-2": {"graph_id": "g2", "hash": ""}}}
+        out = self.run_delete({"LV-1": "a@x.com"})
+        self.assertEqual(out, [("LV-2", "a@x.com", True)])
+        self.assertEqual(self.deleted, [("a@x.com", "g2")])
+
+    def test_checks_every_calendar_from_today_18_months(self):
+        # The last shift of the file, or a facility's only shift, is outside the file's own date range
+        self.cal = {"b@x.com": {"CHI-9": {"graph_id": "g9", "hash": ""}}}
+        self.run_delete({"LV-1": "a@x.com"})
+        self.assertEqual(self.deleted, [("b@x.com", "g9")])
+        self.assertEqual({m for m, _, _ in self.queried}, {"a@x.com", "b@x.com"})
+        _, start, end = self.queried[0]
+        self.assertEqual(start, pd.Timestamp(pd.Timestamp.now(tz="America/Los_Angeles").date()))
+        self.assertEqual((end - start).days, 548)
+
+    def test_row_moved_to_other_calendar_deleted_from_old(self):
+        self.cal = {"a@x.com": {"ORL-1": {"graph_id": "g1", "hash": ""}}}
+        self.run_delete({"ORL-1": "b@x.com"})
+        self.assertEqual(self.deleted, [("a@x.com", "g1")])
+
+    def test_unroutable_row_is_kept(self):
+        self.cal = {"a@x.com": {"ORL-1": {"graph_id": "g1", "hash": ""}}}
+        self.assertEqual(self.run_delete({"ORL-1": None}), [])
+
+    def test_same_mailbox_under_two_addresses(self):
+        # The test calendar is reachable as @ges.com and @viadcorp: the same event is not 'moved'
+        ev = {"LV-1": {"graph_id": "g1", "hash": ""}, "LV-2": {"graph_id": "g2", "hash": ""}}
+        self.cal = {"a@x.com": ev, "b@x.com": ev}
+        self.run_delete({"LV-1": "b@x.com"})
+        self.assertEqual(self.deleted, [("a@x.com", "g2")])   # LV-1 kept; LV-2 deleted once, not twice
+
+    def test_all_calendar_mailboxes(self):
+        os.environ["GRAPH_CALENDAR_MAILBOXES"] = "LOEWS_ELECTRICAL=loews@x.com; LV_ELECTRICAL=default@x.com"
+        os.environ["GRAPH_BRANCH_MAILBOXES"] = "ORL=orl@x.com"
+        try:
+            self.assertEqual(self.ns["_all_calendar_mailboxes"](), {"loews@x.com", "default@x.com", "orl@x.com"})
+        finally:
+            os.environ.pop("GRAPH_CALENDAR_MAILBOXES", None)
+            os.environ.pop("GRAPH_BRANCH_MAILBOXES", None)
+
+
 class SettingsParsing(unittest.TestCase):
     """schedule_config.load: one app setting per item, bad ones skipped with a warning."""
 
