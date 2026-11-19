@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Add / refresh the FACILITY column on the Excel scheduling template, using the FACILITY_ / BRANCH_
-settings (see schedule_config.py):
+Refresh a schedule file (or the template) from the admin workbook (see schedule_config.py):
   - FACILITY column on 'By Day' (inserted before LOCATION if missing) with a dropdown of facility codes
   - facility code table on the 'Lists' sheet (the dropdown's source)
-  - conditional formatting that colors the whole row by facility (FACILITIES[...]['excel_color'])
+  - conditional formatting that colors the whole row by facility (Facilities sheet, EXCEL COLOR)
+  - ID column = formula <ID PREFIX>-<row number - 1>; the prefix is in Lists!P2 (one prefix per file)
+  - Instructions sheet text
 Safe to run again after changing a facility or color.
 
-Usage:  python update_template.py [--from-azure] ["path\\to\\file.xlsx"]   (default: the template in templates\\)
-  --from-azure  use the live App Service settings (needs 'az login'); otherwise settings.local.env
+Usage:  python update_template.py "<admin workbook.xlsx>" ["<file.xlsx>"] [ID PREFIX]
+  file: default the template in the templates folder.  ID PREFIX: default the file's current one (Lists!P2, or the
+  prefix of its first ID). Saved by a script, the IDs have no stored value until Excel opens the file; the
+  app works out the same IDs from the row numbers, so that is fine.
 The file is overwritten; keep a copy first.
 """
 import sys
@@ -19,7 +22,7 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 import schedule_config
-from schedule_config import FACILITIES, BRANCHES
+from schedule_config import FACILITIES
 
 DEFAULT_PATH = r"templates\GES Electrical Show Schedule TEMPLATE.xlsx"
 FAC_HEADER   = "FACILITY"
@@ -59,18 +62,6 @@ def _write_lists(lists):
     lists.column_dimensions[get_column_letter(LISTS_COL)].width = 15
     lists.column_dimensions[get_column_letter(LISTS_COL + 1)].width = 36
 
-def _add_branches(lists):
-    """Add BRANCHES missing from the BRANCH / STATE / TIME ZONE table (Lists C:E); existing rows are kept."""
-    have = {str(lists.cell(r, 3).value).strip().upper() for r in range(2, LISTS_ROWS + 2) if lists.cell(r, 3).value}
-    row = 2
-    for code, b in BRANCHES.items():
-        if code in have:
-            continue
-        while lists.cell(row, 3).value:
-            row += 1
-        for c, val in enumerate([code, b["state"], b["time_zone"]]):
-            lists.cell(row, 3 + c, val)._style = copy(lists.cell(2, 3 + c)._style)
-
 def _set_validations(ws, fac_col, last_row):
     """Re-create the FUNCTION / LOCATION / FACILITY dropdowns. openpyxl can't keep the template's
     original FUNCTION / LOCATION dropdowns (an Excel extension), so they are added back here."""
@@ -104,61 +95,97 @@ def _set_row_colors(ws, fac_col, last_row):
             fill = PatternFill(start_color=f["excel_color"], end_color=f["excel_color"], fill_type="solid")
             ws.conditional_formatting.add(rng, FormulaRule(formula=[f'${letter}2="{code}"'], fill=fill))
 
-FAC_HELP = ("FACILITY - pick the facility code from the dropdown (list is on the 'Lists' sheet). It picks "
-            "the Outlook calendar and colours the row. Leave it blank only if your city has no facilities: "
-            "the row then goes to your city's calendar (from the ID prefix). If your city has no calendar "
-            "set up, the row is not pushed to Outlook.")
+FAC_HELP = ("FACILITY - pick the facility code from the dropdown (list is on the 'Lists' sheet). On the Orlando "
+            "calendars it sets the Outlook color, and it colours the row. It does not pick the calendar: every row "
+            "goes to the calendar of the SharePoint folder the file is saved in.")
+
+# Instructions lines replaced on every run: {start of the old line: new text}
+INSTRUCTION_TEXT = {
+    "3. ID ":            "3. ID fills in automatically: the file's ID PREFIX (Lists sheet, cell P2) + the row number, "
+                         "e.g. LV-0001. Do not type over it.",
+    "   Changing or deleting an ID": "   Add new shifts at the bottom. Inserting, deleting or sorting rows renumbers the rows "
+                         "below; the app then updates those Outlook events. An empty ID cell is fine - the app works "
+                         "out the same ID from the row number.",
+    "   The prefix (":   "   Each file has its own ID PREFIX. Two files must never use the same prefix "
+                         "(the app holds back rows with duplicate IDs).",
+    "   that is how the app knows": "   The time zone comes from the calendar (admin workbook), not from this file.",
+    "ID (required)":     "ID - fills in automatically (formula). Do not type over it.",
+    "Name: ":            "Name: <YEAR> GES Electrical Show Schedule <CITY>.xlsx   "
+                         "(e.g. 2027 GES Electrical Show Schedule ORL Loews.xlsx)",
+    "One file per city": "Save the file in your calendar's folder under ElectricalSchedule (Chicago, Las Vegas, "
+                         "Orlando - Lowes, Orlando Marriott). The folder decides the Outlook calendar.",
+    "Save to the shared SharePoint": "Shifts dated before today are not sent to Outlook. Other sheets in the workbook "
+                         "are fine; the app only reads 'By Day'.",
+}
 
 def _update_instructions(ws):
-    """Document the FACILITY column on the Instructions sheet (added once, text refreshed every run)."""
+    """Document the FACILITY column and the ID formula on the Instructions sheet (text refreshed every run)."""
+    if not any(str(c.value or "").startswith(("FACILITY (", "FACILITY - ")) for c in ws["A"]):
+        ws["A1"] = str(ws["A1"].value).replace("(v1.0)", "(v1.1)")
+        for c in ws["A"]:
+            if str(c.value or "").startswith("5. To cancel a shift"):
+                c.value = ("5. To cancel a shift, delete the row. Do not use strikethrough or colour - the app "
+                           "cannot see formatting. Row colours come automatically from FACILITY.")
+            if str(c.value or "").startswith("FUNCTION (required)"):
+                r = c.row + 1
+                ws.insert_rows(r)
+                ws.cell(r, 1, FAC_HELP)
+                ws.cell(r, 1)._style = copy(c._style)
+                break
+    ws["A1"] = str(ws["A1"].value).replace("(v1.1)", "(v1.2)")
     for c in ws["A"]:
-        if str(c.value or "").startswith(("FACILITY (", "FACILITY - ")):
+        text = str(c.value or "")
+        if text.startswith(("FACILITY (", "FACILITY - ")):
             c.value = FAC_HELP
-            return
-    ws["A1"] = str(ws["A1"].value).replace("(v1.0)", "(v1.1)")
-    for c in ws["A"]:
-        if str(c.value or "").startswith("5. To cancel a shift"):
-            c.value = ("5. To cancel a shift, delete the row. Do not use strikethrough or colour - the app "
-                       "cannot see formatting. Row colours come automatically from FACILITY.")
-        if str(c.value or "").startswith("FUNCTION (required)"):
-            r = c.row + 1
-            ws.insert_rows(r)
-            ws.cell(r, 1, FAC_HELP)
-            ws.cell(r, 1)._style = copy(c._style)
-            break
+        for start, new in INSTRUCTION_TEXT.items():
+            if text.startswith(start):
+                c.value = new
+                break
 
-APP, RG = "app-wus2-elecsch-dv-01", "rg-wus2-elecsch-dv-compute"
+PREFIX_CELL = "P2"                   # Lists!P1 = 'ID PREFIX' header, P2 = this file's prefix
 
-def _use_azure_settings():
-    """Replace FACILITIES / BRANCHES with the ones built from the live App Service settings."""
-    import json, subprocess
-    global FACILITIES, BRANCHES
-    out = subprocess.run(f"az webapp config appsettings list --name {APP} --resource-group {RG} -o json",
-                         capture_output=True, text=True, shell=True, check=True).stdout
-    settings = {s["name"]: s["value"] for s in json.loads(out) if s["name"].upper().startswith(schedule_config.PREFIXES)}
-    FACILITIES, BRANCHES, *_, warnings = schedule_config.load(settings)
-    for w in warnings:
-        print("WARNING:", w)
-    print(f"Using Azure settings: {len(FACILITIES)} facilities, {len(BRANCHES)} branches.")
+def _set_id_formula(ws, lists, prefix):
+    """ID column: =IF(DATE="","",Lists!$P$2&"-"&TEXT(ROW()-1,"0000")) on every row; Lists!P2 holds the prefix."""
+    lists["P1"] = "ID PREFIX"
+    lists["P1"]._style = copy(lists["C1"]._style)
+    lists[PREFIX_CELL] = prefix
+    lists.column_dimensions["P"].width = 12
+    h = _header(ws)
+    id_col, date_col = h.index("ID") + 1, get_column_letter(h.index("DATE") + 1)
+    for r in range(2, ws.max_row + 1):
+        ws.cell(r, id_col).value = f'=IF({date_col}{r}="","",Lists!$P$2&"-"&TEXT(ROW()-1,"0000"))'
 
-def main(path):
+def _current_prefix(ws, lists):
+    if lists[PREFIX_CELL].value:
+        return str(lists[PREFIX_CELL].value).strip()
+    id_col = _header(ws).index("ID") + 1
+    first = next((str(ws.cell(r, id_col).value) for r in range(2, ws.max_row + 1)
+                  if ws.cell(r, id_col).value and not str(ws.cell(r, id_col).value).startswith("=")), "")
+    return first.rsplit("-", 1)[0] if "-" in first else ""
+
+def main(path, prefix=""):
     wb = load_workbook(path)
     ws = wb["By Day"]
+    prefix = prefix or _current_prefix(ws, wb["Lists"])
+    if not prefix:
+        sys.exit(f"{path}: no ID prefix found; give one, e.g. LV")
     h = _header(ws)
     fac_col = h.index(FAC_HEADER) + 1 if FAC_HEADER in h else _insert_facility_column(ws)
     # Optional column (blank = city calendar), so it looks like LOCATION, not the red required headers
     ws.cell(1, fac_col)._style = copy(ws.cell(1, _header(ws).index(INSERT_AT) + 1)._style)
     last_row = ws.max_row
     _write_lists(wb["Lists"])
-    _add_branches(wb["Lists"])
     _set_validations(ws, fac_col, last_row)
     _set_row_colors(ws, fac_col, last_row)
+    _set_id_formula(ws, wb["Lists"], prefix)
     _update_instructions(wb["Instructions"])
     wb.save(path)
-    print(f"Updated {path}: FACILITY in column {get_column_letter(fac_col)}, rows 2-{last_row}.")
+    print(f"Updated {path}: FACILITY in column {get_column_letter(fac_col)}, ID prefix {prefix}, rows 2-{last_row}.")
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--from-azure"]
-    if "--from-azure" in sys.argv:
-        _use_azure_settings()
-    main(args[0] if args else DEFAULT_PATH)
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    schedule_config.apply(sys.argv[1])
+    for w in schedule_config.CONFIG_WARNINGS:
+        print("WARNING:", w)
+    main(sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PATH, sys.argv[3] if len(sys.argv) > 3 else "")

@@ -1,39 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Facility routing and overtime calculation. No Streamlit here, so it can be tested on its own.
-All facility / calendar / rule data comes from schedule_config.py, which reads the app settings.
+Overtime calculation. No Streamlit here, so it can be tested on its own.
+Calendar / rule data comes from schedule_config.py, which reads the admin workbook.
 """
 import re
 import pandas as pd
-from schedule_config import FACILITIES, CALENDARS, OT_RULES, HOLIDAYS, BRANCHES
-
-# ─── FACILITY ROUTING ────────────────────────────────────────────────
-def facility_route(facility, calendar_mailboxes, branch=""):
-    """(mailbox, '') for a row's facility, or (None, reason) when it can't be routed.
-    calendar_mailboxes: {CALENDAR KEY: mailbox} from the GRAPH_CALENDAR_MAILBOXES setting.
-    branch: the row's ID prefix; a facility in another state than the branch is rejected
-    (the branch's state decides the time zone)."""
-    code = str(facility or "").strip().upper()
-    if not code:
-        return None, "FACILITY is blank"
-    fac = FACILITIES.get(code)
-    if fac is None:
-        return None, f"'{code}' is not a known facility code"
-    b = BRANCHES.get(str(branch or "").upper())
-    if b and fac["state"] and fac["state"] != b["state_code"]:
-        return None, (f"{code} is in {fac['state']}, but this {str(branch).upper()} spreadsheet is for "
-                      f"{b['state']}; move the row to the {fac['state']} spreadsheet")
-    if not fac["calendar"]:
-        return None, f"no Outlook calendar is configured for {code} yet"
-    mailbox = calendar_mailboxes.get(fac["calendar"])
-    if not mailbox:
-        return None, (f"the {CALENDARS.get(fac['calendar'], fac['calendar'])} calendar has no mailbox "
-                      f"set (GRAPH_CALENDAR_MAILBOXES)")
-    return mailbox, ""
-
-def has_facility(value):
-    """False for rows from files without a FACILITY column (value None/NaN)."""
-    return value is not None and not (isinstance(value, float) and pd.isna(value))
+from schedule_config import CALENDARS, OT_RULES, HOLIDAYS
 
 # ─── OVERTIME ────────────────────────────────────────────────────────
 _TIME_RE = re.compile(r"(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})")  # same TIME format the importer accepts
@@ -51,11 +23,8 @@ def shift_span(time_str):
     return start, (end - start) / 60
 
 def _ot_region(row):
-    """Rules region for a row: from its facility, or from the ID prefix when FACILITY is blank or absent."""
-    fac = row.get("FACILITY")
-    if has_facility(fac) and fac:
-        return FACILITIES.get(str(fac), {}).get("ot_region")
-    return row.get("BRANCH") or None
+    """Rules region for a row: the OT REGION of its calendar (admin Calendars sheet)."""
+    return (CALENDARS.get(row.get("CALENDAR")) or {}).get("ot_region")
 
 def _premium_day(day, region, rules):
     """Reason the whole day is OT ('Holiday', 'Sunday', 'Saturday'), or ''."""
@@ -75,13 +44,13 @@ def compute_overtime(df):
     - Other days: a person's hours past daily_hours (summed over that day's shifts in start-time order) are OT.
     - Each hour is counted once, under one reason.
     - Unnamed crew (+N) can't be tracked across shifts, so each one is treated as its own person per shift.
-    - STATUS is 'ok', 'no OT rules' (region has no rules configured) or 'no TIME' (hours unknown).
+    - STATUS is 'ok', 'no OT rules' (the calendar has no OT rules configured) or 'no TIME' (hours unknown).
     """
     people = []
     for _, r in df.iterrows():
         start, hours = shift_span(r["TIME"])
         base = {"EVENT_ID": r["EVENT_ID"], "DATE": r["DATE"], "SHOW": r["SHOW"], "FUNCTION": r["FUNCTION"],
-                "TIME": r["TIME"], "FACILITY": r.get("FACILITY") if has_facility(r.get("FACILITY")) else "",
+                "TIME": r["TIME"], "FACILITY": r.get("FACILITY") or "",
                 "REGION": _ot_region(r), "_START": start, "HOURS": hours, "_TIMED": start is not None}
         for name in r["CREW_LIST"]:
             people.append({**base, "PERSON": name, "NAMED": True, "_KEY": name})

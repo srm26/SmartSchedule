@@ -1,28 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 GES SmartSchedule - AI-Powered Electrical Labor Calendar
+The page shows every schedule file in the SharePoint calendar folders; the sidebar picks the calendar to view.
+The 15-minute Outlook sync runs on its own (sync_engine.py, started by startup.sh).
 """
-import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
-import re
-import io
-import json
-import hashlib
-from pathlib import Path
-from datetime import datetime as dt
-from zoneinfo import ZoneInfo
+from datetime import timedelta
 
-_PT = ZoneInfo("America/Los_Angeles")
-import msal
+from schedule_config import CALENDARS, FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, CONFIG_WARNINGS
+from schedule_logic import compute_overtime, ot_summary
+from sync_engine import (graph_secrets_ok, get_graph_token, load_all, duplicate_ids, route_rows,
+                         facility_warnings, sync_rows, remove_deleted_shifts, ensure_outlook_categories,
+                         sweep_status, sweep_test_rows, set_sweep_test_rows, today, SYNC_MINUTES)
 import requests
-from html import escape
-from openpyxl import load_workbook
-from apscheduler.schedulers.background import BackgroundScheduler
-from schedule_config import FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, OUTLOOK_CATEGORIES, CONFIG_WARNINGS
-from schedule_logic import facility_route, has_facility, compute_overtime, ot_summary
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────
 st.set_page_config(
@@ -79,430 +71,7 @@ st.markdown("""
 
 # ─── CONSTANTS ───────────────────────────────────────────────────────
 FUNCTION_COLORS = {"SET": "#3b82f6", "STRIKE": "#ef4444", "STANDBY": "#f59e0b"}
-LV_SHEET        = "By Day"
-LV_CREW_COLS    = [1, 2, 3, 4, 5, 6, 7]   # numeric header columns for crew slots
-LISTS_SHEET     = "Lists"                  # holds the BRANCH / STATE / TIME ZONE lookup
-DEFAULT_TZ      = "Pacific Standard Time"  # used when a row's branch has no lookup entry (e.g. legacy LV IDs)
-LINK_COL        = "SHAREPOINT LINK"        # optional By Day column; shown on the Outlook event notes
-FACILITY_COL    = "FACILITY"               # By Day column; facility code that picks the Outlook calendar
-
-# ─── OUTLOOK BODY MARKERS ────────────────────────────────────────────
-# EVENT_ID and field hash are stored in the first line of the event body.
-# Outlook is the source of truth — no local file needed.
-
-def _field_hash(row):
-    key = "|".join(str(row.get(f, "")) for f in ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"])
-    if row.get("LINK"):  # only when present, so rows without a link keep their existing hash
-        key += "|" + str(row["LINK"])
-    if _event_categories(row):  # same idea: only colored functions get a new hash (one-time update)
-        key += "|cat:" + ",".join(_event_categories(row))
-    return hashlib.md5(key.encode()).hexdigest()[:8]
-
-def _event_categories(row):
-    """Outlook categories (event color) for the row's FUNCTION, from OUTLOOK_CATEGORIES."""
-    cat = OUTLOOK_CATEGORIES.get(str(row.get("FUNCTION", "")).upper())
-    return [cat["name"]] if cat else []
-
-_PRESET_NAMES = {"preset0": "red", "preset1": "orange", "preset2": "brown", "preset3": "yellow", "preset4": "green",
-                 "preset5": "teal", "preset6": "olive", "preset7": "blue", "preset8": "purple",
-                 "preset9": "cranberry", "preset12": "gray"}
-
-def ensure_outlook_categories(token, mailbox):
-    """Create missing OUTLOOK_CATEGORIES (name + color) in the mailbox's category list.
-    Returns '' or an error message (e.g. missing MailboxSettings.ReadWrite permission)."""
-    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/outlook/masterCategories"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        return (f"could not read Outlook categories in {mailbox} ({resp.status_code}). Events are still tagged; "
-                f"to show colors, grant the app MailboxSettings.ReadWrite or create the categories by hand: "
-                + ", ".join(f"{c['name']} ({_PRESET_NAMES.get(c['color'], c['color'])})"
-                            for c in OUTLOOK_CATEGORIES.values()))
-    have = {c["displayName"].lower() for c in resp.json().get("value", [])}
-    for c in OUTLOOK_CATEGORIES.values():
-        if c["name"].lower() not in have:
-            r = requests.post(url, headers=headers, json={"displayName": c["name"], "color": c["color"]}, timeout=15)
-            if r.status_code not in (200, 201):
-                return f"could not create Outlook category {c['name']} in {mailbox} ({r.status_code})"
-    return ""
-
-def _event_notes(row):
-    """Outlook notes text: foreman, the NOTES column, and the SharePoint link on its own line."""
-    notes = f"Foreman: {row['FOREMAN']}. {row['NOTES']}".strip()
-    if row.get("LINK"):
-        label = row.get("LINK_TEXT") or row["LINK"]
-        notes += f"\nSharePoint: [{label}]({row['LINK']})"  # turned into a clickable link by _make_body
-    return notes
-
-def _make_body(notes, event_id, field_hash):
-    """HTML event body: marker line, then the notes; '[label](url)' becomes a clickable link."""
-    marker = f"GES_ID:{event_id}|GES_HASH:{field_hash}"
-    html = escape(f"{marker}\n{notes}".strip() if notes else marker)
-    html = re.sub(r"\[([^\]\n]+)\]\((\S+?)\)", r'<a href="\2">\1</a>', html)
-    return html.replace("\n", "<br>")
-
-def _parse_body(body_content):
-    """Extract (event_id, field_hash) from event body, or ('', '') if not present."""
-    for line in (body_content or "").splitlines():
-        line = line.strip()
-        if line.startswith("GES_ID:") and "|GES_HASH:" in line:
-            parts = line.split("|GES_HASH:")
-            return parts[0].replace("GES_ID:", "").strip(), parts[1].strip() if len(parts) > 1 else ""
-    return "", ""
-
-def build_calendar_map(token, mailbox, start_date, end_date):
-    """Query Outlook for the date range and return {EVENT_ID: {graph_id, hash}}."""
-    url    = f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
-    params = {
-        "startDateTime": start_date.strftime("%Y-%m-%dT00:00:00Z"),
-        "endDateTime":   (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"),
-        "$select": "id,body",
-        "$top": "500",
-    }
-    headers = {"Authorization": f"Bearer {token}", "Prefer": "outlook.body-content-type='text'"}
-    mapping, next_url, next_params = {}, url, params
-    while next_url:
-        resp = requests.get(next_url, headers=headers, params=next_params, timeout=15)
-        if resp.status_code != 200:
-            break
-        data = resp.json()
-        for e in data.get("value", []):
-            body_text = e.get("body", {}).get("content", "")
-            eid, fhash = _parse_body(body_text)
-            if eid:
-                mapping[eid] = {"graph_id": e["id"], "hash": fhash}
-        next_url, next_params = data.get("@odata.nextLink"), None
-    return mapping
-
-# ─── GRAPH HELPERS ───────────────────────────────────────────────────
-def _graph_cfg():
-    """Read Graph credentials from env vars (App Service) or secrets.toml (local)."""
-    env = {
-        "app_id":         os.environ.get("GRAPH_APP_ID"),
-        "tenant_id":      os.environ.get("GRAPH_TENANT_ID"),
-        "client_secret":  os.environ.get("GRAPH_CLIENT_SECRET"),
-        "shared_mailbox": os.environ.get("GRAPH_SHARED_MAILBOX"),
-    }
-    if all(env.values()):
-        return env
-    try:
-        return dict(st.secrets["graph"])
-    except Exception:
-        return env
-
-def _mailbox_setting(env_name, secrets_key):
-    """{KEY: mailbox} from a 'KEY=a@x.com; KEY2=b@x.com' app setting, or the secrets.toml key locally."""
-    raw = os.environ.get(env_name)
-    if raw is None:
-        raw = _graph_cfg().get(secrets_key, "")
-    mapping = {}
-    for pair in str(raw).split(";"):
-        if "=" in pair:
-            k, mbx = pair.split("=", 1)
-            if mbx.strip():
-                mapping[k.strip().upper()] = mbx.strip()
-    return mapping
-
-def _mailbox_for(branch):
-    """Shared mailbox for a branch, from GRAPH_BRANCH_MAILBOXES ('LV=a@x.com; ORL=b@x.com',
-    app setting or secrets.toml branch_mailboxes). Unlisted branches use the default shared mailbox."""
-    mapping = _mailbox_setting("GRAPH_BRANCH_MAILBOXES", "branch_mailboxes")
-    return mapping.get(str(branch or "").upper()) or _graph_cfg()["shared_mailbox"]
-
-def _route_rows(df):
-    """(mailbox, error) per row. Rows with a FACILITY go to that facility's calendar (FACILITY_ settings +
-    GRAPH_CALENDAR_MAILBOXES); an unknown or unmapped facility gets an error and is not pushed.
-    A blank FACILITY (cities without facilities) goes to the city's calendar from the ID prefix, only if
-    that branch is listed in GRAPH_BRANCH_MAILBOXES; otherwise it's an error too.
-    Files without a FACILITY column keep the older routing by ID prefix (_mailbox_for)."""
-    cal_mbx    = _mailbox_setting("GRAPH_CALENDAR_MAILBOXES", "calendar_mailboxes")
-    branch_mbx = _mailbox_setting("GRAPH_BRANCH_MAILBOXES", "branch_mailboxes")
-
-    def route(r):
-        if not has_facility(r["FACILITY"]):
-            return _mailbox_for(r["BRANCH"]), ""
-        if r["FACILITY"]:
-            return facility_route(r["FACILITY"], cal_mbx, r["BRANCH"])
-        branch = str(r["BRANCH"] or "").upper()
-        if branch in branch_mbx:
-            return branch_mbx[branch], ""
-        return None, ("FACILITY is blank and " + (f"branch {branch} has no city calendar" if branch
-                      else "the ID has no branch prefix") + " in GRAPH_BRANCH_MAILBOXES")
-
-    routes = [route(r) for _, r in df.iterrows()]
-    return (pd.Series([m for m, _ in routes], index=df.index, dtype=object),
-            pd.Series([e for _, e in routes], index=df.index, dtype=object))
-
-def _graph_secrets_ok():
-    try:
-        return bool(_graph_cfg()["client_secret"])
-    except Exception:
-        return False
-
-def get_graph_token():
-    g = _graph_cfg()
-    app = msal.ConfidentialClientApplication(
-        client_id=g["app_id"],
-        client_credential=g["client_secret"],
-        authority=f"https://login.microsoftonline.com/{g['tenant_id']}",
-    )
-    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-    if "access_token" in result:
-        return result["access_token"]
-    raise RuntimeError(result.get("error_description", "Graph auth failed"))
-
-def _make_event_id(show, function, date):
-    slug = re.sub(r"[^A-Za-z0-9]", "", str(show))[:20].upper()
-    return f"{slug}-{function}-{date.strftime('%Y%m%d')}"
-
-def patch_graph_event(token, mailbox, graph_id, start_dt, end_dt,
-                      location="", notes="", time_str="", event_id="", field_hash="", subject="",
-                      time_zone=DEFAULT_TZ, categories=None):
-    url     = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events/{graph_id}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    t_start, t_end = _parse_time_range(time_str)
-    body_text = _make_body(notes, event_id, field_hash)
-    if t_start and t_end:
-        payload = {
-            "subject": subject, "isAllDay": False,
-            "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
-            "end":   {"dateTime": _timed_end(end_dt, t_start, t_end),         "timeZone": time_zone},
-            "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "HTML", "content": body_text},
-        }
-    else:
-        payload = {
-            "subject": subject, "isAllDay": True,
-            "start": {"dateTime": start_dt.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
-            "end":   {"dateTime": (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
-            "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "HTML", "content": body_text},
-        }
-    payload["categories"] = categories or []
-    return requests.patch(url, headers=headers, json=payload, timeout=15)
-
-def delete_graph_event(token, mailbox, graph_id):
-    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events/{graph_id}"
-    return requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-
-def _parse_time_range(time_str):
-    """Parse '8:00 - 16:30' into ('08:00', '16:30'), or return (None, None)."""
-    if not time_str:
-        return None, None
-    m = re.match(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})", str(time_str).strip())
-    if not m:
-        return None, None
-    def pad(t):
-        h, mi = t.split(":")
-        return f"{int(h):02d}:{mi}"
-    return pad(m.group(1)), pad(m.group(2))
-
-def _timed_end(end_dt, t_start, t_end):
-    """End dateTime string for a timed event. Overnight shifts ('22:00 - 02:00', '20:00 - 24:00')
-    end on the next day; otherwise Outlook rejects an end that is before the start."""
-    if t_end == "24:00":
-        t_end = "00:00"
-    if t_end <= t_start:
-        end_dt = end_dt + timedelta(days=1)
-    return end_dt.strftime(f"%Y-%m-%dT{t_end}:00")
-
-def create_graph_event(token, mailbox, subject, start_dt, end_dt,
-                       location="", notes="", time_str="", event_id="", field_hash="", time_zone=DEFAULT_TZ,
-                       categories=None):
-    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/events"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    t_start, t_end = _parse_time_range(time_str)
-    body_text = _make_body(notes, event_id, field_hash)
-    if t_start and t_end:
-        payload = {
-            "subject": subject, "isAllDay": False,
-            "start": {"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": time_zone},
-            "end":   {"dateTime": _timed_end(end_dt, t_start, t_end),       "timeZone": time_zone},
-            "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "HTML", "content": body_text},
-        }
-    else:
-        payload = {
-            "subject": subject, "isAllDay": True,
-            "start": {"dateTime": start_dt.strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
-            "end":   {"dateTime": (end_dt + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00"), "timeZone": "UTC"},
-            "location": {"displayName": location or "Not specified"},
-            "body": {"contentType": "HTML", "content": body_text},
-        }
-    payload["categories"] = categories or []
-    return requests.post(url, headers=headers, json=payload, timeout=15)
-
-# ─── SHAREPOINT HELPERS ──────────────────────────────────────────────
-SP_HOSTNAME = "viadcorp.sharepoint.com"
-SP_SITE     = "/sites/ErinsTestSandbox"
-SP_FOLDER   = "Attachments/ElectricalSchedule"
-
-def _sp_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-def get_sharepoint_files(token):
-    site = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{SP_HOSTNAME}:{SP_SITE}",
-        headers=_sp_headers(token), timeout=10,
-    )
-    site.raise_for_status()
-    site_id = site.json()["id"]
-
-    drive = requests.get(
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive",
-        headers=_sp_headers(token), timeout=10,
-    )
-    drive.raise_for_status()
-    drive_id = drive.json()["id"]
-
-    children = requests.get(
-        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{SP_FOLDER}:/children",
-        headers=_sp_headers(token),
-        params={"$select": "id,name,lastModifiedDateTime,file", "$top": "100"},
-        timeout=10,
-    )
-    children.raise_for_status()
-    return drive_id, [
-        {"name": i["name"], "id": i["id"],
-         "modified":         i.get("lastModifiedDateTime", ""),        # full ISO for change detection
-         "modified_display": dt.fromisoformat(i["lastModifiedDateTime"].replace("Z", "+00:00"))
-                               .astimezone(_PT).strftime("%Y-%m-%d %H:%M PT")}  # for UI
-        for i in children.json().get("value", [])
-        if i.get("name", "").endswith(".xlsx") and "file" in i
-    ]
-
-def download_sharepoint_file(token, drive_id, item_id):
-    resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
-        headers=_sp_headers(token), timeout=30, allow_redirects=True,
-    )
-    resp.raise_for_status()
-    return resp.content
-
-# ─── LV FORMAT IMPORTER ──────────────────────────────────────────────
-def _read_branch_time_zones(xl):
-    """Return {BRANCH: Outlook time zone} from the 'Lists' sheet, or {} if the sheet/table is absent."""
-    if LISTS_SHEET not in xl.sheet_names:
-        return {}
-    lists = xl.parse(LISTS_SHEET, header=0, dtype=str)
-    lists.columns = [str(c).strip().upper() for c in lists.columns]
-    if "BRANCH" not in lists.columns or "TIME ZONE" not in lists.columns:
-        return {}
-    pairs = lists[["BRANCH", "TIME ZONE"]].dropna()
-    return {b.strip().upper(): tz.strip() for b, tz in pairs.itertuples(index=False) if b.strip() and tz.strip()}
-
-def _cell_text(val):
-    """Cell value as stripped text; empty cells (NaN/None) become '' instead of 'nan'."""
-    s = str(val if val is not None else "").strip()
-    return "" if s.lower() in ("nan", "none") else s
-
-def _read_link_urls(src, sheet_name):
-    """{ID: URL} for SHAREPOINT LINK cells that are hyperlinks. pandas only sees the text Excel
-    displays (often a file name), so the URL behind the cell is read with openpyxl."""
-    if hasattr(src, "seek"):
-        src.seek(0)
-    ws = load_workbook(src, data_only=True)[sheet_name]
-    header = [str(c.value).strip().upper() if c.value is not None else "" for c in ws[1]]
-    if LINK_COL not in header or "ID" not in header:
-        return {}
-    li, ii = header.index(LINK_COL), header.index("ID")
-    urls = {}
-    for row in ws.iter_rows(min_row=2):
-        cell = row[li]
-        if cell.hyperlink is not None and cell.hyperlink.target:
-            id_val = row[ii].value
-            if isinstance(id_val, float) and id_val.is_integer():
-                id_val = int(id_val)  # match parse_lv_byDay's ID handling
-            urls[_cell_text(id_val)] = cell.hyperlink.target
-    return urls
-
-def parse_lv_byDay(uploaded_file, sheet_name):
-    """Parse the 'By Day' sheet from the LV GES Electrical Show Schedule format.
-
-    Expected columns: DAY, DATE, TIME, SHOW, FUNCTION, LOCATION, NOTES, FOREMAN, 1..7
-    Crew columns 1-7 hold names or '+N' (extra unnamed crew).
-    Each row's time zone comes from its ID prefix (e.g. 'ORL-0001' -> ORL) looked up in
-    the BRANCH / TIME ZONE table on the 'Lists' sheet; no prefix or no table -> DEFAULT_TZ.
-    Optional FACILITY column (facility code, picks the Outlook calendar per row): stored upper-cased;
-    None on every row when the file has no FACILITY column.
-    """
-    xl = pd.ExcelFile(uploaded_file)
-    # Read crew columns as text, otherwise a column holding only '+1' comes back as 1.0
-    raw = xl.parse(sheet_name, header=0, dtype={c: str for c in LV_CREW_COLS})
-    branch_tz = _read_branch_time_zones(xl)
-    link_urls = _read_link_urls(uploaded_file, sheet_name) if LINK_COL in raw.columns else {}
-
-    required = {"DATE", "SHOW", "FUNCTION", "LOCATION", "NOTES", "FOREMAN"}
-    present  = {str(c).strip().upper() for c in raw.columns}
-    missing  = required - present
-    if missing:
-        raise ValueError(f"Sheet '{sheet_name}' is missing expected columns: {', '.join(sorted(missing))}")
-
-    crew_cols = [c for c in raw.columns if isinstance(c, int)]
-    has_fac   = FACILITY_COL in raw.columns
-
-    rows = []
-    for _, r in raw.iterrows():
-        date = pd.to_datetime(r.get("DATE"), errors="coerce")
-        if pd.isna(date) or date.year < 2020:
-            continue
-        show = str(r.get("SHOW", "") or "").strip()
-        if not show or show.lower() in ("nan", "none"):
-            continue
-
-        foreman_val = str(r.get("FOREMAN", "") or "").strip()
-        foreman     = foreman_val if foreman_val and foreman_val.lower() not in ("nan", "none", "") else "TBD"
-
-        crew_list = [foreman] if foreman != "TBD" else []
-        extra = 0
-        for cc in crew_cols:
-            val = str(r.get(cc, "") or "").strip()
-            if not val or val.lower() in ("nan", "none", ""):
-                continue
-            if val.startswith("+"):
-                try:
-                    extra += int(val[1:])
-                except ValueError:
-                    extra += 1
-            else:
-                crew_list.append(val)
-
-        fn = str(r.get("FUNCTION", "") or "").strip().upper() or "SHOW"
-        id_val = r.get("ID", "")
-        if isinstance(id_val, float) and id_val.is_integer():
-            id_val = int(id_val)  # Excel numbers come in as 1.0 — store as "1"
-        raw_id = str(id_val or "").strip()
-        event_id = raw_id if raw_id and raw_id.lower() not in ("nan", "none") else _make_event_id(show, fn, date)
-        m = re.match(r"([A-Za-z]+)-\d", raw_id)
-        branch = m.group(1).upper() if m else ""
-        if branch and branch_tz and branch not in branch_tz:
-            raise ValueError(f"ID '{raw_id}': branch '{branch}' is not in the BRANCH / TIME ZONE table "
-                             f"on the '{LISTS_SHEET}' sheet.")
-        rows.append({
-            "EVENT_ID":      event_id,
-            "DATE":          date,
-            "END_DATE":      pd.NaT,
-            "SHOW":          show,
-            "FUNCTION":      fn,
-            "LOCATION":      str(r.get("LOCATION", "") or "").strip(),
-            "TIME":          str(r.get("TIME", "") or "").strip(),
-            "FOREMAN":       foreman,
-            "NOTES":         _cell_text(r.get("NOTES")),
-            "TOTAL_CREW":    max(len(crew_list) + extra, 1),
-            "CREW_LIST":     crew_list,
-            "SCHEDULE_TYPE": "shifts",
-            "TIME_ZONE":     branch_tz.get(branch, DEFAULT_TZ),
-            # LINK = the URL (from the hyperlink behind the cell if there is one); LINK_TEXT = what the cell shows
-            "LINK":          link_urls.get(raw_id) or _cell_text(r.get(LINK_COL)),
-            "LINK_TEXT":     _cell_text(r.get(LINK_COL)),
-            "BRANCH":        branch,
-            "FACILITY":      _cell_text(r.get(FACILITY_COL)).upper() if has_fac else None,
-            "EXTRA_CREW":    extra,  # unnamed '+N' crew, used by the Overtime page
-        })
-
-    if not rows:
-        raise ValueError("No valid shifts found in the selected sheet.")
-    return pd.DataFrame(rows).reset_index(drop=True)
+ALL_VIEW        = "All calendars"
 
 # ─── DATA HELPERS ────────────────────────────────────────────────────
 def build_notifications(df, demo_contacts):
@@ -553,227 +122,27 @@ def _build_ics(df_shifts, cal_name):
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines).encode()
 
-# ─── AUTO-SWEEP ENGINE ───────────────────────────────────────────────
-# On App Service the app folder is a read-only package; /home is writable and survives restarts.
-SWEEP_STATE_FILE = (Path("/home/data/sweep_state.json") if os.environ.get("WEBSITE_SITE_NAME")
-                    else Path(".streamlit/sweep_state.json"))
+# ─── LOAD EVERY SCHEDULE FROM SHAREPOINT ─────────────────────────────
+@st.cache_data(ttl=300, show_spinner="Reading the schedules from SharePoint...")
+def _load_sharepoint():
+    """(files, {path: df}, {path: error}). Also loads the admin settings into schedule_config."""
+    files, parsed, errors, _ = load_all(get_graph_token())
+    return files, parsed, errors
 
-@st.cache_resource
-def _get_sweep_status():
-    return {"last_check": None, "running": False, "log": [], "error": None}
+if not graph_secrets_ok():
+    st.error("Microsoft Graph credentials are not configured (GRAPH_APP_ID, GRAPH_TENANT_ID, GRAPH_CLIENT_SECRET), "
+             "so SharePoint can't be read.")
+    st.stop()
+try:
+    sp_files, sp_parsed, sp_errors = _load_sharepoint()
+except Exception as e:
+    st.error(f"SharePoint error: {e}")
+    st.stop()
 
-@st.cache_resource
-def _get_sweep_config():
-    return {"test_rows": 0}  # off after every restart, so business edits sync in full
-
-def _load_sweep_state():
-    try:
-        return json.loads(SWEEP_STATE_FILE.read_text()) if SWEEP_STATE_FILE.exists() else {}
-    except Exception:
-        return {}
-
-def _save_sweep_state(s):
-    SWEEP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SWEEP_STATE_FILE.write_text(json.dumps(s, indent=2))
-
-def _load_folder(token):
-    """Download and parse every LV-format file in the SharePoint folder.
-    Files without a 'By Day' sheet are not schedules and are ignored.
-    Returns (sp_files, {name: df}, {name: error})."""
-    drive_id, sp_files = get_sharepoint_files(token)
-    parsed, errors = {}, {}
-    for f in sp_files:
-        try:
-            raw = download_sharepoint_file(token, drive_id, f["id"])
-            if LV_SHEET not in pd.ExcelFile(io.BytesIO(raw)).sheet_names:
-                continue
-            parsed[f["name"]] = parse_lv_byDay(io.BytesIO(raw), LV_SHEET)
-        except Exception as e:
-            errors[f["name"]] = str(e)
-    return sp_files, parsed, errors
-
-DELETE_DAYS_AHEAD = 548  # removed shifts are deleted from today through about 18 months ahead
-
-def _all_calendar_mailboxes():
-    """Every calendar the app can push to (facility calendars, city calendars, default shared mailbox)."""
-    return ({*_mailbox_setting("GRAPH_CALENDAR_MAILBOXES", "calendar_mailboxes").values(),
-             *_mailbox_setting("GRAPH_BRANCH_MAILBOXES", "branch_mailboxes").values(),
-             _graph_cfg().get("shared_mailbox")} - {None, ""})
-
-def _delete_removed(token, keep_ids, mailboxes):
-    """Delete app events, from today on, in every calendar, whose ID is in no schedule file, or whose row now
-    routes to a different calendar (facility changed). keep_ids: {EVENT_ID: mailbox it routes to, or None}.
-    One mailbox can be listed under two addresses; it returns the same event id under both, so an event seen
-    under its row's address is not 'moved'. Returns [(EVENT_ID, mailbox, deleted_ok)]."""
-    start = pd.Timestamp(dt.now(_PT).date())
-    end   = start + timedelta(days=DELETE_DAYS_AHEAD)
-    maps  = {m: build_calendar_map(token, m, start, end) for m in sorted(mailboxes)}
-    done, gone = [], set()
-    for mbx, cal_map in maps.items():
-        for eid, entry in cal_map.items():
-            if eid in keep_ids:
-                target = keep_ids[eid]
-                if target in (None, mbx):
-                    continue
-                if maps.get(target, {}).get(eid, {}).get("graph_id") == entry["graph_id"]:
-                    continue  # same mailbox under its other address
-            if entry["graph_id"] in gone:
-                continue      # already deleted through the mailbox's other address
-            try:
-                ok = delete_graph_event(token, mbx, entry["graph_id"]).status_code in (200, 204)
-            except Exception:
-                ok = False
-            if ok:
-                gone.add(entry["graph_id"])
-            done.append((eid, mbx, ok))
-    return done
-
-def _sync_dataframe(token, mailbox, df_file):
-    """Run create/update sync for one parsed dataframe. Returns stats dict. Deletes are done separately
-    for the whole folder by _delete_removed."""
-    cal_map = build_calendar_map(token, mailbox, df_file["DATE"].min(), df_file["DATE"].max())
-    created = updated = skipped = failed = 0
-    for _, row in df_file.iterrows():
-        eid     = row["EVENT_ID"]
-        subject = f"{row['SHOW']} - {row['FUNCTION']}"
-        end_dt  = row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"]
-        notes   = _event_notes(row)
-        fhash   = _field_hash(row)
-        try:
-            entry = cal_map.get(eid)
-            if entry and entry["hash"] == fhash:
-                skipped += 1
-            elif entry:
-                resp = patch_graph_event(token, mailbox, entry["graph_id"],
-                                         row["DATE"], pd.Timestamp(end_dt),
-                                         row["LOCATION"], notes,
-                                         time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                         time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
-                                         subject=subject)
-                if resp.status_code == 200:
-                    updated += 1
-                elif resp.status_code == 404:
-                    resp2 = create_graph_event(token, mailbox, subject,
-                                               row["DATE"], pd.Timestamp(end_dt),
-                                               row["LOCATION"], notes,
-                                               time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                               time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row))
-                    created += 1 if resp2.status_code == 201 else 0
-                    failed  += 0 if resp2.status_code == 201 else 1
-                else:
-                    failed += 1
-            else:
-                resp = create_graph_event(token, mailbox, subject,
-                                          row["DATE"], pd.Timestamp(end_dt),
-                                          row["LOCATION"], notes,
-                                          time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                          time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row))
-                created += 1 if resp.status_code == 201 else 0
-                failed  += 0 if resp.status_code == 201 else 1
-        except Exception:
-            failed += 1
-
-    return {"created": created, "updated": updated, "skipped": skipped, "failed": failed}
-
-def run_sweep():
-    status = _get_sweep_status()
-    config = _get_sweep_config()
-    status["running"] = True
-    status["error"]   = None
-    log = []
-    try:
-        token    = get_graph_token()
-        sp_files, parsed, errors = _load_folder(token)
-        state    = _load_sweep_state()
-        limit    = config.get("test_rows", 0)
-
-        log += [f"⚠️ {w}" for w in CONFIG_WARNINGS]  # facility / branch / OT settings that couldn't be read
-        cat_checked = set()  # mailboxes whose Outlook categories (event colors) were checked this sweep
-        for f in sp_files:
-            fname    = f["name"]
-            last_mod = f["modified"]
-            if state.get(fname, {}).get("last_modified") == last_mod:
-                continue  # unchanged — skip
-            if fname in errors:
-                log.append(f"❌ {fname} — Error: {errors[fname]}")
-                continue
-            if fname not in parsed:
-                continue  # not an LV schedule file
-            try:
-                df_f   = parsed[fname]
-                if limit > 0:
-                    df_f = df_f.head(limit)
-                # Each row goes to its facility's calendar; rows that can't be routed are not pushed
-                mbx_s, err_s = _route_rows(df_f)
-                ok     = err_s == ""
-                stats  = {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
-                for mbx, grp in df_f[ok].groupby(mbx_s[ok]):
-                    if mbx not in cat_checked:
-                        cat_checked.add(mbx)
-                        if (cat_err := ensure_outlook_categories(token, mbx)):
-                            log.append(f"⚠️ Event colors: {cat_err}")
-                    for k, v in _sync_dataframe(token, mbx, grp).items():
-                        stats[k] += v
-                result = (f"Created:{stats['created']} Updated:{stats['updated']} "
-                          f"Skipped:{stats['skipped']} Failed:{stats['failed']}")
-                if not ok.all():
-                    bad = [f"{e}: {m}" for e, m in zip(df_f.loc[~ok, "EVENT_ID"], err_s[~ok])]
-                    result += f" Not pushed:{len(bad)} ({'; '.join(bad[:3])}{'; ...' if len(bad) > 3 else ''})"
-                # Rows not pushed are retried next sweep (e.g. once their calendar mailbox is configured)
-                state[fname] = {"last_modified": last_mod if ok.all() else None,
-                                "last_synced":   dt.now(_PT).strftime("%Y-%m-%d %H:%M PT"),
-                                "result":        result}
-                log.append(f"✅ {fname} — {result}")
-            except Exception as e:
-                log.append(f"❌ {fname} — Error: {e}")
-
-        _save_sweep_state(state)
-
-        # Every sweep, remove calendar events whose shift is no longer in any file in the folder
-        # (also covers a whole file removed). Uses the full files, even in sweep test mode.
-        if errors:  # an unreadable file's events would look removed
-            status["error"] = ("Deleted shifts were NOT removed from Outlook — could not read: "
-                               + ", ".join(errors) + ". Fix or remove that file.")
-        elif not parsed:  # empty listing: don't wipe every calendar on a SharePoint hiccup
-            log.append("⚠️ No schedule files in the folder — removed-shift check skipped.")
-        else:
-            keep_ids = {}
-            for d in parsed.values():
-                keep_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
-            removed = _delete_removed(token, keep_ids, _all_calendar_mailboxes())
-            if removed:
-                ok_ids  = [e for e, _, ok in removed if ok]
-                bad_ids = [e for e, _, ok in removed if not ok]
-                log.append(f"🗑️ Removed {len(ok_ids)} event(s) no longer in Excel"
-                           + (f": {', '.join(ok_ids[:10])}{' ...' if len(ok_ids) > 10 else ''}" if ok_ids else ""))
-                if bad_ids:
-                    status["error"] = f"Could not delete {len(bad_ids)} removed event(s): {', '.join(bad_ids[:10])}"
-    except Exception as e:
-        status["error"] = str(e)
-        log.append(f"❌ Sweep error: {e}")
-    finally:
-        status["last_check"] = dt.now(_PT).strftime("%Y-%m-%d %H:%M PT")
-        status["running"]    = False
-        status["log"]        = log
-
-@st.cache_resource
-def _ensure_scheduler():
-    # Streamlit re-runs this script on every click; cache_resource keeps one scheduler per server process.
-    sched = BackgroundScheduler(timezone="UTC")
-    sched.add_job(run_sweep, "interval", minutes=15,
-                  id="sp_sweep", next_run_time=dt.utcnow())
-    sched.start()
-    return sched
-
-if _graph_secrets_ok():
-    _ensure_scheduler()
-
-# ─── SESSION STATE ───────────────────────────────────────────────────
-for _k, _v in [("df", None), ("file_name", None), ("notifs", None), ("ai_done", False), ("sp_item_id", None)]:
+for _k, _v in [("notifs", None), ("ai_done", False), ("view_shown", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
-# Re-assign every run so the nav radio keeps its page while hidden during Change File
-# (otherwise Streamlit drops its value and the server falls out of sync with the browser).
+# Re-assign every run so the nav radio keeps its page
 st.session_state.nav = st.session_state.get("nav", "Dashboard")
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────
@@ -783,45 +152,33 @@ with st.sidebar:
     st.caption("AI-Powered Electrical Labor Calendar")
     st.divider()
 
-    if st.session_state.df is not None:
-        st.success(f"**{st.session_state.file_name}**")
-        st.caption(
-            f"{len(st.session_state.df):,} rows  "
-            f"({st.session_state.df['SCHEDULE_TYPE'].iloc[0]})"
-        )
-        if st.button("Change File", use_container_width=True):
-            for k in ("df", "file_name", "notifs", "sp_item_id"):
-                st.session_state[k] = None
-            st.session_state.ai_done = False
-            st.rerun()
-        st.divider()
-        page = st.radio(
-            "Navigation",
-            ["Dashboard", "Schedule & Push", "Calendar View", "Crew Lookup", "Overtime"],
-            key="nav", label_visibility="collapsed",
-        )
-    else:
-        st.warning("No file loaded")
-        page = "_upload"
+    view = st.selectbox("Calendar", [ALL_VIEW] + list(CALENDARS), key="view")
+    if st.button("Refresh from SharePoint", use_container_width=True):
+        _load_sharepoint.clear()
+        st.rerun()
+    st.divider()
+    page = st.radio(
+        "Navigation",
+        ["Dashboard", "Schedule & Push", "Calendar View", "Crew Lookup", "Overtime"],
+        key="nav", label_visibility="collapsed",
+    )
 
     st.divider()
     st.markdown("**Auto-Sync**")
-    _cfg = _get_sweep_config()
-    _sts = _get_sweep_status()
-    _test_on = st.checkbox("Sweep test mode", value=_cfg["test_rows"] > 0)
-    if _test_on:
-        _n = st.number_input("Rows to sync", min_value=1, max_value=50,
-                             value=max(_cfg["test_rows"], 2), step=1)
-        _cfg["test_rows"] = int(_n)
-    else:
-        _cfg["test_rows"] = 0
-    if _sts["running"]:
+    st.caption(f"Runs every {SYNC_MINUTES} minutes, also when nobody has the app open.")
+    _test_rows = sweep_test_rows()
+    _test_on = st.checkbox("Sweep test mode", value=_test_rows > 0)
+    _n = int(st.number_input("Rows to sync", min_value=1, max_value=50, value=max(_test_rows, 2), step=1)) if _test_on else 0
+    if _n != _test_rows:
+        set_sweep_test_rows(_n)
+    _sts = sweep_status()
+    if _sts.get("running"):
         st.info("Syncing now...")
-    elif _sts["last_check"]:
+    elif _sts.get("last_check"):
         st.success(f"Last check: {_sts['last_check']}")
-        for entry in _sts["log"]:
+        for entry in _sts.get("log", []):
             st.caption(entry)
-        if _sts["error"]:
+        if _sts.get("error"):
             st.error(_sts["error"])
     else:
         st.caption("Waiting for first sweep...")
@@ -835,118 +192,22 @@ with col_title:
     st.caption("AI-Powered Electrical Labor Calendar — replacing manual Union Outlook entry")
 st.divider()
 
-# ═══════════════════════════════════════════════════════════════════
-# UPLOAD — LV format ("By Day" sheet)
-# ═══════════════════════════════════════════════════════════════════
-if st.session_state.df is None:
-    st.markdown('<div class="section-title">Load Schedule</div>', unsafe_allow_html=True)
+for w in CONFIG_WARNINGS:  # admin workbook rows that couldn't be read
+    st.warning(w)
+for name, err in sp_errors.items():
+    st.error(f"**{name}** could not be read: {err}")
 
-    source = st.radio("Source", ["SharePoint", "Upload from computer"], horizontal=True)
-    st.divider()
-
-    file_bytes = None
-    file_label = None
-
-    if source == "SharePoint":
-        if not _graph_secrets_ok():
-            st.error("Graph credentials not configured — cannot connect to SharePoint.")
-            st.stop()
-        with st.spinner("Connecting to SharePoint..."):
-            try:
-                token    = get_graph_token()
-                drive_id, sp_files = get_sharepoint_files(token)
-            except Exception as e:
-                st.error(f"SharePoint error: {e}")
-                st.stop()
-
-        if not sp_files:
-            st.warning(f"No .xlsx files found in `{SP_FOLDER}`.")
-            st.stop()
-
-        options  = {f"{f['name']}  (modified {f['modified_display']})": f for f in sp_files}
-        selected = st.selectbox("Select file", list(options.keys()))
-        sp_file  = options[selected]
-
-        if st.button("Load from SharePoint", type="primary", use_container_width=True):
-            with st.spinner(f"Downloading {sp_file['name']}..."):
-                try:
-                    raw = download_sharepoint_file(token, drive_id, sp_file["id"])
-                except Exception as e:
-                    st.error(f"Download failed: {e}")
-                    st.stop()
-            try:
-                xl    = pd.ExcelFile(io.BytesIO(raw))
-                sheet = LV_SHEET if LV_SHEET in xl.sheet_names else xl.sheet_names[0]
-                parsed = parse_lv_byDay(io.BytesIO(raw), sheet)
-            except Exception as e:
-                st.error(f"Could not parse file: {e}")
-                st.stop()
-            st.session_state.df        = parsed
-            st.session_state.file_name = sp_file["name"]
-            st.session_state.sp_item_id = sp_file["id"]
-            st.session_state.notifs    = None
-            st.session_state.ai_done   = False
-            st.rerun()
-        st.stop()
-
-    else:
-        st.markdown(
-            "Upload the **GES Electrical Show Schedule** Excel file (.xlsx). "
-            "The app reads the **By Day** sheet."
-        )
-        uploaded = st.file_uploader("Choose Excel file (.xlsx)", type=["xlsx"])
-        if not uploaded:
-            st.stop()
-
-        file_bytes = uploaded.read()
-        file_label = uploaded.name
-
-        try:
-            xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        except Exception as e:
-            st.error(f"Could not open file: {e}")
-            st.stop()
-
-        if LV_SHEET in xl.sheet_names:
-            sheet = LV_SHEET
-            st.caption(f"Sheet auto-selected: **{sheet}**")
-        else:
-            sheet = st.selectbox(
-                f"No '{LV_SHEET}' sheet found — select the scheduling sheet:",
-                xl.sheet_names,
-            )
-
-        try:
-            parsed = parse_lv_byDay(io.BytesIO(file_bytes), sheet)
-        except Exception as e:
-            st.error(f"Could not parse file: {e}")
-            st.stop()
-
-        st.success(f"**{len(parsed):,} shifts** found across **{parsed['SHOW'].nunique()}** shows.")
-        _, _errs = _route_rows(parsed)
-        if (_errs != "").any():
-            st.warning(f"**{int((_errs != '').sum())}** row(s) have a FACILITY problem and will not be pushed "
-                       f"to Outlook (details on the Push to Outlook tab).")
-
-        with st.expander("Preview (first 10 rows)"):
-            _fac = ["FACILITY"] if has_facility(parsed["FACILITY"].iloc[0]) else []
-            p = parsed[["DATE","SHOW"] + _fac + ["FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]].head(10).copy()
-            p["DATE"] = p["DATE"].dt.strftime("%Y-%m-%d")
-            st.dataframe(p, hide_index=True, use_container_width=True)
-
-        if st.button("Load Schedule", type="primary", use_container_width=True):
-            st.session_state.df        = parsed
-            st.session_state.file_name = file_label
-            st.session_state.sp_item_id = None
-            st.session_state.notifs    = None
-            st.session_state.ai_done   = False
-            st.rerun()
-
-        st.stop()
-
-# ─── From here, df is guaranteed loaded ──────────────────────────────
-df    = st.session_state.df
+# ─── The rows of the chosen calendar (or all) ────────────────────────
+_frames = [d for d in sp_parsed.values() if view == ALL_VIEW or d["CALENDAR"].iloc[0] == view]
+if not _frames:
+    st.info(f"No schedule files found for **{view}**. Save the schedule in the calendar's SharePoint folder, "
+            f"then click Refresh from SharePoint.")
+    st.stop()
+df    = pd.concat(_frames, ignore_index=True)
 stype = df["SCHEDULE_TYPE"].iloc[0]
+view_label = view if view == ALL_VIEW else f"{view} calendar"
+if st.session_state.view_shown != view:  # notifications were built for another view
+    st.session_state.update(view_shown=view, notifs=None, ai_done=False)
 
 # ═══════════════════════════════════════════════════════════════════
 # PAGE: DASHBOARD
@@ -963,7 +224,7 @@ if "Dashboard" in page:
         st.markdown(f"""<div class="metric-card">
             <div class="metric-label">Total Shifts / Events</div>
             <div class="metric-value">{total}</div>
-            <div class="metric-delta">{st.session_state.file_name}</div>
+            <div class="metric-delta">{view_label}</div>
         </div>""", unsafe_allow_html=True)
     with c2:
         st.markdown(f"""<div class="metric-card">
@@ -985,7 +246,18 @@ if "Dashboard" in page:
         </div>""", unsafe_allow_html=True)
 
     st.divider()
-    st.markdown('<div class="section-title">Loaded Schedule — Recent 20 Rows</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Schedule Files in SharePoint</div>', unsafe_allow_html=True)
+    _files = pd.DataFrame([
+        {"Calendar": f["calendar"], "File": f["path"], "Modified": f["modified_display"],
+         "Shifts": len(sp_parsed[f["path"]]) if f["path"] in sp_parsed else 0,
+         "From Today On": int((sp_parsed[f["path"]]["DATE"] >= today()).sum()) if f["path"] in sp_parsed else 0,
+         "Status": "Error: " + sp_errors[f["path"]] if f["path"] in sp_errors
+                   else ("OK" if f["path"] in sp_parsed else "Not a schedule (no By Day sheet)")}
+        for f in sp_files if view == ALL_VIEW or f["calendar"] == view])
+    st.dataframe(_files, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown('<div class="section-title">Schedule — Recent 20 Rows</div>', unsafe_allow_html=True)
     recent = df.sort_values("DATE").tail(20)[
         ["DATE","SHOW","FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]
     ].copy()
@@ -1017,9 +289,8 @@ elif "Schedule" in page:
 
     # ── Preview ──────────────────────────────────────────────────────
     with tab_prev:
-        st.caption(f"Source: **{st.session_state.file_name}** · {len(df):,} rows · {stype}")
-        show_cols = [c for c in ["DATE","SHOW","FACILITY","FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]
-                     if c in df.columns and (c != "FACILITY" or has_facility(df["FACILITY"].iloc[0]))]
+        st.caption(f"Source: **{view_label}** · {len(df):,} rows · {stype}")
+        show_cols = ["DATE","CALENDAR","SHOW","FACILITY","FUNCTION","LOCATION","TIME","FOREMAN","TOTAL_CREW"]
         d = df[show_cols].copy()
         d["DATE"] = d["DATE"].dt.strftime("%Y-%m-%d")
         st.dataframe(d, use_container_width=True, hide_index=True)
@@ -1079,221 +350,90 @@ elif "Schedule" in page:
 
     # ── Push to Outlook ──────────────────────────────────────────────
     with tab_push:
-        st.markdown('<div class="section-title">Push to Shared Outlook Calendar</div>', unsafe_allow_html=True)
-        if not _graph_secrets_ok():
-            st.error("Microsoft Graph credentials not configured.")
-            st.markdown("""
-Fill in `.streamlit/secrets.toml` (or Azure App Service Application Settings):
-```toml
-[graph]
-app_id         = "2fafc3de-feac-47cf-b231-f16de70392c3"
-tenant_id      = "286f2b7d-9113-445b-ae51-103e88d4584a"
-client_secret  = "your-secret"
-shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
-```
-            """)
-        else:
-            g              = _graph_cfg()
-            shared_mailbox = g["shared_mailbox"]
-            for w in CONFIG_WARNINGS:  # facility / branch / OT app settings that couldn't be read
-                st.warning(w)
-            # Each row goes to its facility's calendar (files without FACILITY: by ID prefix)
-            mbx_s, err_s = _route_rows(df)
-            ok_s = err_s == ""
-            if not has_facility(df["FACILITY"].iloc[0]):
-                st.warning(f"This file has no **{FACILITY_COL}** column, so rows are routed by ID prefix "
-                           f"(older format). Move the rows to the current template to route by facility.")
-                label = df["BRANCH"].replace("", "no prefix")
-            else:  # blank FACILITY rows go by city: show them as e.g. 'ORL (no facility)'
-                label = df["FACILITY"].where(df["FACILITY"] != "",
-                                             df["BRANCH"].replace("", "no prefix") + " (no facility)")
-            if ok_s.any():
-                dest = label[ok_s].groupby(mbx_s[ok_s]).unique()
-                st.info("Pushing to: " + "; ".join(f"**{', '.join(sorted(ks))}** → {m}"
-                                                   for m, ks in dest.items()))
-            if not ok_s.all():
-                st.error(f"**{int((~ok_s).sum())}** row(s) will NOT be pushed until their FACILITY is fixed "
-                         f"or its calendar is configured:")
-                bad = df.loc[~ok_s, ["EVENT_ID", "DATE", "SHOW", "FACILITY"]].assign(Problem=err_s[~ok_s])
-                bad["DATE"] = bad["DATE"].dt.strftime("%Y-%m-%d")
-                st.dataframe(bad, hide_index=True, use_container_width=True)
+        st.markdown('<div class="section-title">Push to Outlook Calendars</div>', unsafe_allow_html=True)
+        st.caption("Auto-Sync does this every 15 minutes. Use this to push the shown calendar now.")
+        dups   = duplicate_ids(list(sp_parsed.values()))
+        future = df["DATE"] >= today()
+        df_fut = df[future]
+        mbx_s, err_s = route_rows(df_fut, dups)
+        ok_s = err_s == ""
+        if (~future).any():
+            st.info(f"**{int((~future).sum())}** row(s) are dated before today and are not pushed. "
+                    f"Past events already in Outlook stay as history.")
+        if ok_s.any():
+            dest = df_fut.loc[ok_s, "CALENDAR"].groupby(mbx_s[ok_s]).unique()
+            st.info("Pushing to: " + "; ".join(f"**{', '.join(sorted(ks))}** → {m}" for m, ks in dest.items()))
+        if not ok_s.all():
+            st.error(f"**{int((~ok_s).sum())}** row(s) will NOT be pushed until fixed:")
+            bad = df_fut.loc[~ok_s, ["EVENT_ID", "DATE", "SHOW", "FILE"]].assign(Problem=err_s[~ok_s])
+            bad["DATE"] = bad["DATE"].dt.strftime("%Y-%m-%d")
+            st.dataframe(bad, hide_index=True, use_container_width=True)
+        fac_w = facility_warnings(df_fut)
+        if (fac_w != "").any():
+            st.warning(f"**{int((fac_w != '').sum())}** row(s) have a FACILITY note. They are still pushed to "
+                       f"their folder's calendar, without a facility color:")
+            w = df_fut.loc[fac_w != "", ["EVENT_ID", "DATE", "SHOW", "FACILITY", "FILE"]].assign(Note=fac_w[fac_w != ""])
+            w["DATE"] = w["DATE"].dt.strftime("%Y-%m-%d")
+            st.dataframe(w, hide_index=True, use_container_width=True)
 
-            col_test, _ = st.columns([1, 3])
-            with col_test:
-                if st.button("Test Connection"):
-                    with st.spinner("Authenticating..."):
-                        try:
-                            tok  = get_graph_token()
-                            resp = requests.get(
-                                f"https://graph.microsoft.com/v1.0/users/{shared_mailbox}",
-                                headers={"Authorization": f"Bearer {tok}"}, timeout=10,
-                            )
-                            if resp.status_code == 200:
-                                st.success(f"Connected: **{resp.json().get('displayName', shared_mailbox)}**")
-                            else:
-                                st.error(f"Failed ({resp.status_code})")
-                        except Exception as e:
-                            st.error(f"Auth error: {e}")
-
-            st.divider()
-            st.caption(f"**{len(df):,}** events from **{st.session_state.file_name}** ready to push.")
-            with st.expander("Preview first 10 events"):
-                for _, row in df.head(10).iterrows():
-                    start = row["DATE"].strftime("%Y-%m-%d")
-                    end   = row["END_DATE"].strftime("%Y-%m-%d") if pd.notna(row["END_DATE"]) else start
-                    label = start if start == end else f"{start} to {end}"
-                    st.write(f"**{row['SHOW']}** | {label} | {row['LOCATION'] or '—'}")
-
-            test_mode = st.checkbox("Test mode (push a few events only)", value=True)
-            test_n    = st.number_input("Number of events to push", min_value=1, max_value=len(df),
-                                        value=2, step=1) if test_mode else len(df)
-            df_push   = df.head(int(test_n))
-
-            if test_mode:
-                st.caption(f"Test mode: will push **{int(test_n)}** of {len(df)} events.")
-            if not st.session_state.sp_item_id:
-                st.warning("This file was uploaded from your computer. Auto-sync treats the SharePoint folder as "
-                           "the master list, so its events will be removed at the next sync (within 15 minutes). "
-                           "Save the file to the SharePoint folder to keep them on the calendar.")
-
-            if st.button("Push to Shared Calendar", type="primary", use_container_width=True):
-                try:
-                    token = get_graph_token()
-                except Exception as e:
-                    st.error(f"Auth failed: {e}")
-                    st.stop()
-
-                # A SharePoint file may have been moved or deleted since it was loaded
-                if st.session_state.sp_item_id:
+        col_test, _ = st.columns([1, 3])
+        with col_test:
+            if st.button("Test Connection"):
+                with st.spinner("Checking each calendar..."):
                     try:
-                        _, sp_now = get_sharepoint_files(token)
+                        tok = get_graph_token()
+                        for key, c in CALENDARS.items():
+                            if not c["mailbox"]:
+                                st.warning(f"{key}: no mailbox set")
+                                continue
+                            r = requests.get(f"https://graph.microsoft.com/v1.0/users/{c['mailbox']}/calendar",
+                                             headers={"Authorization": f"Bearer {tok}"}, timeout=10)
+                            (st.success if r.status_code == 200 else st.error)(
+                                f"{key} → {c['mailbox']}: " + ("connected" if r.status_code == 200
+                                                               else f"failed ({r.status_code})"))
                     except Exception as e:
-                        st.error(f"Could not check SharePoint: {e}")
-                        st.stop()
-                    if st.session_state.sp_item_id not in {f["id"] for f in sp_now}:
-                        st.error(f"**{st.session_state.file_name}** is no longer in the SharePoint "
-                                 f"folder, so nothing was pushed. Click Change File to load another file.")
-                        st.stop()
+                        st.error(f"Auth error: {e}")
 
-                created = updated = failed = skipped = deleted = 0
-                results = []
-                stat = st.empty()
+        st.divider()
+        st.caption(f"**{len(df_fut):,}** events from today on in **{view_label}**.")
+        test_mode = st.checkbox("Test mode (push a few events only)", value=True)
+        test_n    = st.number_input("Number of events to push", min_value=1, max_value=max(len(df_fut), 1),
+                                    value=min(2, max(len(df_fut), 1)), step=1) if test_mode else len(df_fut)
+        if test_mode:
+            st.caption(f"Test mode: will push **{int(test_n)}** of {len(df_fut)} events.")
 
-                stat.text("Reading shared calendar from Outlook...")
-                cal_maps = {m: build_calendar_map(token, m, df["DATE"].min(), df["DATE"].max())
-                            for m in set(mbx_s[ok_s])}
-                for m in cal_maps:  # SET / STRIKE colors (OUTLOOK_CATEGORIES); push continues either way
+        if st.button("Push to Outlook", type="primary", use_container_width=True, disabled=df_fut.empty):
+            try:
+                token = get_graph_token()
+            except Exception as e:
+                st.error(f"Auth failed: {e}")
+                st.stop()
+            with st.spinner("Pushing to Outlook..."):
+                for m in set(mbx_s[ok_s]):  # event colors; push continues either way
                     if (cat_err := ensure_outlook_categories(token, m)):
                         st.warning(f"Event colors: {cat_err}")
-
-                bar = st.progress(0)
-                for i, (idx, row) in enumerate(df_push.iterrows()):
-                    eid     = row["EVENT_ID"]
-                    if err_s[idx]:
-                        failed += 1
-                        results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Not pushed: {err_s[idx]}"})
-                        bar.progress((i + 1) / len(df_push))
-                        continue
-                    subject = f"{row['SHOW']} - {row['FUNCTION']}"
-                    end_dt  = row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"]
-                    notes   = _event_notes(row)
-                    fhash   = _field_hash(row)
-                    mbx     = mbx_s[idx]
-                    cal_map = cal_maps[mbx]
-                    stat.text(f"Processing {i+1}/{len(df_push)}: {str(row['SHOW'])[:60]}...")
-                    try:
-                        entry = cal_map.get(eid)
-                        if entry and entry["hash"] == fhash:
-                            skipped += 1
-                            results.append({"ID": eid, "Event": row["SHOW"], "Status": "Skipped (no change)"})
-                        elif entry:
-                            resp = patch_graph_event(
-                                token, mbx, entry["graph_id"],
-                                row["DATE"], pd.Timestamp(end_dt),
-                                row["LOCATION"], notes,
-                                time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
-                                subject=subject,
-                            )
-                            if resp.status_code == 200:
-                                updated += 1
-                                results.append({"ID": eid, "Event": row["SHOW"], "Status": "Updated"})
-                            elif resp.status_code == 404:
-                                resp2 = create_graph_event(
-                                    token, mbx, subject,
-                                    row["DATE"], pd.Timestamp(end_dt),
-                                    row["LOCATION"], notes,
-                                    time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                    time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
-                                )
-                                if resp2.status_code == 201:
-                                    created += 1
-                                    results.append({"ID": eid, "Event": row["SHOW"], "Status": "Created (restored)"})
-                                else:
-                                    failed += 1
-                                    msg = resp2.json().get("error", {}).get("message", "")[:80]
-                                    results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Failed: {msg}"})
-                            else:
-                                failed += 1
-                                msg = resp.json().get("error", {}).get("message", "")[:80]
-                                results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Failed: {msg}"})
-                        else:
-                            resp = create_graph_event(
-                                token, mbx, subject,
-                                row["DATE"], pd.Timestamp(end_dt),
-                                row["LOCATION"], notes,
-                                time_str=row["TIME"], event_id=eid, field_hash=fhash,
-                                time_zone=row.get("TIME_ZONE", DEFAULT_TZ), categories=_event_categories(row),
-                            )
-                            if resp.status_code == 201:
-                                created += 1
-                                results.append({"ID": eid, "Event": row["SHOW"], "Status": "Created"})
-                            else:
-                                failed += 1
-                                msg = resp.json().get("error", {}).get("message", "")[:80]
-                                results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Failed: {msg}"})
-                    except Exception as e:
-                        failed += 1
-                        results.append({"ID": eid, "Event": row["SHOW"], "Status": f"Error: {e}"})
-                    bar.progress((i + 1) / len(df_push))
-
-                # Delete Outlook events (today on, every calendar) whose ID is no longer in this full Excel or
-                # any other SharePoint file, or whose row now goes to a different calendar. Runs in test mode
-                # too: removing a shift that is gone from Excel is always right.
-                excel_ids = {}  # {EVENT_ID: mailbox it routes to, or None}
-                try:
-                    _, others, errs = _load_folder(token)
-                except Exception as e:
-                    others, errs = {}, {"SharePoint folder": str(e)}
-                if errs:
-                    st.error("Deleted shifts were NOT removed from Outlook — could not read: "
-                             + ", ".join(errs) + ". Fix or remove that file, then push again.")
-                else:
-                    for name, d in others.items():
-                        if name != st.session_state.file_name:
-                            excel_ids.update(zip(d["EVENT_ID"], _route_rows(d)[0]))
-                    excel_ids.update(zip(df["EVENT_ID"], mbx_s))
-                    stat.text("Removing shifts that are no longer in Excel...")
-                    for eid, _, ok in _delete_removed(token, excel_ids, _all_calendar_mailboxes()):
-                        if ok:
-                            deleted += 1
-                            results.append({"ID": eid, "Event": "—", "Status": "Deleted (removed from Excel)"})
-                        else:
-                            failed += 1
-                            results.append({"ID": eid, "Event": "—", "Status": "Delete failed"})
-
-                stat.empty()
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Created",  created)
-                c2.metric("Updated",  updated)
-                c3.metric("Deleted",  deleted)
-                c4.metric("Skipped",  skipped)
-                c5.metric("Failed",   failed)
+                stats, results, not_pushed = sync_rows(token, df_fut.head(int(test_n)), dups)
+                results += [{"ID": e, "Show": "—", "Status": f"Not pushed: {m}"} for e, m in not_pushed]
+                # Remove shifts deleted from Excel (today on, every calendar), from a fresh read of SharePoint
+                _, parsed_now, errors_now, _ = load_all(token)
+                removed, problem = remove_deleted_shifts(token, parsed_now, errors_now)
+                results += [{"ID": e, "Show": "—", "Status": "Deleted (removed from Excel)" if ok else "Delete failed"}
+                            for e, _, ok in removed]
+            if problem:
+                st.error(problem)
+            failed = stats["failed"] + len(not_pushed) + sum(1 for *_, ok in removed if not ok)
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Created", stats["created"])
+            c2.metric("Updated", stats["updated"])
+            c3.metric("Deleted", sum(1 for *_, ok in removed if ok))
+            c4.metric("Skipped", stats["skipped"])
+            c5.metric("Failed",  failed)
+            if results:
                 st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-                if failed == 0:
-                    st.success("Done. Check the shared Outlook calendar.")
-                else:
-                    st.warning(f"{failed} event(s) failed. See table above.")
+            if failed == 0:
+                st.success("Done. Check the Outlook calendars.")
+            else:
+                st.warning(f"{failed} event(s) failed or were not pushed. See table above.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1301,7 +441,7 @@ shared_mailbox = "AzureAutomationTest-PIT65@viadcorp.onmicrosoft.com"
 # ═══════════════════════════════════════════════════════════════════
 elif "Calendar" in page:
     st.markdown('<div class="section-title">Labor Calendar</div>', unsafe_allow_html=True)
-    st.caption(f"Source: **{st.session_state.file_name}** · {stype}")
+    st.caption(f"Source: **{view_label}** · {stype}")
 
     # ── Filters ──────────────────────────────────────────────────────
     f1, f2, f3, f4 = st.columns([1, 2, 2, 3])
@@ -1542,7 +682,7 @@ elif "Crew" in page:
 # ═══════════════════════════════════════════════════════════════════
 elif "Overtime" in page:
     st.markdown('<div class="section-title">Overtime</div>', unsafe_allow_html=True)
-    st.caption(f"Source: **{st.session_state.file_name}** · rules and holidays come from the OT_RULES_ / HOLIDAYS_ app settings")
+    st.caption(f"Source: **{view_label}** · rules and holidays come from the admin workbook (OT Rules and Holidays sheets)")
 
     ot_all = compute_overtime(df)  # on the whole file, so daily totals see every shift before filtering
     if ot_all.empty:
@@ -1565,7 +705,7 @@ elif "Overtime" in page:
     n_norule = int((ot["STATUS"] == "no OT rules").sum())
     n_notime = int((ot["STATUS"] == "no TIME").sum())
     if n_norule:
-        st.warning(f"{n_norule} crew shift(s) are at facilities/branches with no OT rules configured yet; "
+        st.warning(f"{n_norule} crew shift(s) are on calendars with no OT rules yet (admin workbook); "
                    f"their hours are counted as regular.")
     if n_notime:
         st.caption(f"{n_notime} crew shift(s) have no TIME, so their hours are unknown (counted as 0).")
@@ -1615,8 +755,8 @@ elif "Overtime" in page:
 
     with st.expander("OT rules and holidays in use"):
         for region, rules in OT_RULES.items():
-            facs = ", ".join(c for c, f in FACILITIES.items() if f["ot_region"] == region)
-            st.markdown(f"**{region}** ({facs}): over {rules['daily_hours']} hrs on a normal workday"
+            cals = ", ".join(k for k, c in CALENDARS.items() if c["ot_region"] == region)
+            st.markdown(f"**{region}** ({cals}): over {rules['daily_hours']} hrs on a normal workday"
                         + (", Saturday" if rules.get("saturday") else "")
                         + (", Sunday" if rules.get("sunday") else "")
                         + (", holidays" if rules.get("holidays") else "") + " = OT")

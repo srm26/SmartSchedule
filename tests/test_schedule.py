@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """Run:  python -m unittest discover -s tests -v   (from the project folder)"""
-import ast
-import os
-import re
-import sys
+import hashlib
 import shutil
+import sys
 import tempfile
+import types
 import unittest
 import warnings
 from pathlib import Path
@@ -15,183 +14,316 @@ from openpyxl import load_workbook
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-# Facility / branch / OT settings come from environment variables; use the test copy, not Azure or local files
-for _line in (Path(__file__).with_name("settings.test.env")).read_text(encoding="utf8").splitlines():
-    _name, _sep, _value = _line.partition("=")
-    if _sep and not _line.startswith("#"):
-        os.environ[_name.strip()] = _value
-from schedule_config import FACILITIES, HOLIDAYS                                   # noqa: E402
-from schedule_logic import facility_route, compute_overtime, ot_summary, shift_span  # noqa: E402
+import schedule_config                                                      # noqa: E402
+import sync_engine as se                                                    # noqa: E402
+from schedule_config import CALENDARS, FACILITIES, HOLIDAYS                 # noqa: E402
+from schedule_logic import compute_overtime, ot_summary, shift_span        # noqa: E402
 
 TEMPLATE = ROOT / "templates" / "GES Electrical Show Schedule TEMPLATE.xlsx"
-OLD_TEMPLATE = ROOT / "templates" / "_backup" / "GES Electrical Show Schedule TEMPLATE (v1.0).xlsx"
 warnings.simplefilter("ignore")
 
+# Same content as the admin workbook on SharePoint (test mailboxes)
+ADMIN = {
+    "Calendars": (["CALENDAR", "SHAREPOINT FOLDER", "MAILBOX", "TIME ZONE", "COLOR BY", "OT REGION"], [
+        ["CHI", "Chicago", "test@x.com", "Central Standard Time", "FUNCTION", ""],
+        ["LV", "Las Vegas", "test@x.com", "Pacific Standard Time", "FUNCTION", ""],
+        ["ORL LOEWS", "Orlando - Lowes", "loews@x.com", "Eastern Standard Time", "FACILITY", "ORL"],
+        ["ORL MARRIOTT", "Orlando Marriott", "test@x.com", "Eastern Standard Time", "FUNCTION", "ORL"]]),
+    "Facilities": (["FACILITY CODE", "FACILITY NAME", "CITY", "STATE", "CALENDAR", "OUTLOOK COLOR", "EXCEL COLOR"], [
+        ["HARROC", "Hard Rock", "Orlando", "FL", "ORL LOEWS", "red", "FF7C80"],
+        ["HELIOS", "Helios", "Orlando", "FL", "ORL LOEWS", "purple", "CC99FF"],
+        ["PORBAY", "Portofino", "Orlando", "FL", "ORL LOEWS", "yellow", "FFFF66"],
+        ["ROYPAC", "Royal Pacific", "Orlando", "FL", "ORL LOEWS", "orange", "FFB366"],
+        ["LSAPP", "Sapphire Falls", "Orlando", "FL", "ORL LOEWS", "blue", "99CCFF"],
+        ["MARWCR", "Marriott", "Orlando", "FL", "ORL MARRIOTT", "", ""],
+        ["HILLV", "Westgate Las Vegas Resort & Casino", "Las Vegas", "NV", "LV", "", ""],
+        ["SHECHI", "Sheraton Grand Chicago", "Chicago", "IL", "CHI", "", ""]]),
+    "Function Colors": (["FUNCTION", "OUTLOOK COLOR"], [["SET", "green"], ["STRIKE", "red"]]),
+    "OT Rules": (["OT REGION", "DAILY HOURS", "SATURDAY", "SUNDAY", "HOLIDAYS"], [["ORL", "8", "Yes", "Yes", "Yes"]]),
+    "Holidays": (["OT REGION", "DATE", "HOLIDAY"], [["ORL", d, ""] for d in
+                 ["2027-01-01", "2027-01-18", "2027-02-15", "2027-05-31", "2027-07-05", "2027-11-25", "2027-12-24"]]),
+}
 
-def _load_app_functions(names, extra_ns=None):
-    """Load selected functions/constants from app.py without running the Streamlit app
-    (importing app.py would start the SharePoint sweep)."""
-    tree = ast.parse((ROOT / "app.py").read_text(encoding="utf8"))
-    ns = {"pd": pd, "re": re, "os": os, "load_workbook": load_workbook,
-          "facility_route": facility_route, **(extra_ns or {})}
-    from schedule_logic import has_facility
-    ns["has_facility"] = has_facility
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id.isupper():
-            try:
-                exec(compile(ast.Module([node], []), "app.py", "exec"), ns)
-            except Exception:
-                pass
-        if isinstance(node, ast.FunctionDef) and node.name in names:
-            exec(compile(ast.Module([node], []), "app.py", "exec"), ns)
-    return ns
+
+def _tables(admin=ADMIN):
+    return {name: pd.DataFrame(rows, columns=cols, dtype=str) for name, (cols, rows) in admin.items()}
 
 
-def _row(date, time, crew, extra=0, facility="HARROC", eid=None, branch=""):
+def _install(admin=ADMIN):
+    """Load test settings into schedule_config's dicts, the way apply() does for the real workbook."""
+    new = schedule_config.load(_tables(admin))
+    for target, value in zip((schedule_config.CALENDARS, schedule_config.FACILITIES, schedule_config.FUNCTION_COLORS,
+                              schedule_config.OT_RULES, schedule_config.HOLIDAYS), new):
+        target.clear()
+        target.update(value)
+    schedule_config.CONFIG_WARNINGS[:] = new[5]
+
+
+_install()
+
+FUTURE = (se.today() + pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+PAST   = (se.today() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+
+
+def _row(date, time, crew, extra=0, facility="HARROC", eid=None, calendar="ORL LOEWS"):
     return {"EVENT_ID": eid or f"T-{date}-{time}", "DATE": pd.Timestamp(date), "SHOW": "S", "FUNCTION": "SET",
-            "TIME": time, "CREW_LIST": crew, "EXTRA_CREW": extra, "FACILITY": facility, "BRANCH": branch}
+            "TIME": time, "CREW_LIST": crew, "EXTRA_CREW": extra, "FACILITY": facility, "CALENDAR": calendar}
 
 
-class FacilityRouting(unittest.TestCase):
-    MBX = {"LOEWS_ELECTRICAL": "loews@x.com"}
-
-    def test_all_loews_facilities_go_to_loews_calendar(self):
-        for code in ("HARROC", "HELIOS", "PORBAY", "ROYPAC", "LSAPP"):
-            self.assertEqual(facility_route(code, self.MBX), ("loews@x.com", ""))
-
-    def test_lowercase_and_spaces_accepted(self):
-        self.assertEqual(facility_route(" harroc ", self.MBX)[0], "loews@x.com")
-
-    def test_blank_unknown_unmapped_are_rejected(self):
-        for code, msg in [("", "blank"), (None, "blank"), ("XYZ", "not a known facility"),
-                          ("MARWCR", "no mailbox set"), ("HILLV", "no mailbox set"),
-                          ("SHECHI", "no mailbox set")]:
-            mbx, err = facility_route(code, self.MBX)
-            self.assertIsNone(mbx, code)
-            self.assertIn(msg, err)
-
-    def test_each_facility_routes_to_its_calendar_mailbox(self):
-        mbx = {"LOEWS_ELECTRICAL": "loews@x.com", "ORL_MARRIOTT": "orl@x.com",
-               "LV_ELECTRICAL": "lv@x.com", "CHI_ELECTRICAL": "chi@x.com"}
-        self.assertEqual([facility_route(c, mbx)[0] for c in ("HARROC", "MARWCR", "HILLV", "SHECHI")],
-                         ["loews@x.com", "orl@x.com", "lv@x.com", "chi@x.com"])
-
-    def test_state_check_uses_branch(self):
-        mbx = {"LOEWS_ELECTRICAL": "loews@x.com", "LV_ELECTRICAL": "lv@x.com"}
-        self.assertEqual(facility_route("HARROC", mbx, "ORL"), ("loews@x.com", ""))
-        self.assertEqual(facility_route("HILLV", mbx, "LV"), ("lv@x.com", ""))
-        self.assertIsNone(facility_route("HARROC", mbx, "LV")[0])
-        self.assertIsNone(facility_route("SHECHI", mbx, "ORLM")[0])
-        self.assertEqual(facility_route("HARROC", mbx, ""), ("loews@x.com", ""))  # no prefix: can't check state
-
-    def test_calendar_without_mailbox_setting_is_rejected(self):
-        mbx, err = facility_route("HARROC", {})
-        self.assertIsNone(mbx)
-        self.assertIn("GRAPH_CALENDAR_MAILBOXES", err)
+def _shift(eid, date=FUTURE, calendar="LV", function="SET", facility=""):
+    return {"EVENT_ID": eid, "DATE": pd.Timestamp(date), "END_DATE": pd.NaT, "SHOW": "S", "FUNCTION": function,
+            "LOCATION": "", "TIME": "08:00 - 12:00", "FOREMAN": "TBD", "NOTES": "", "LINK": "", "LINK_TEXT": "",
+            "FACILITY": facility, "CALENDAR": calendar, "TIME_ZONE": "Pacific Standard Time"}
 
 
-class AppRouteRows(unittest.TestCase):
-    """_route_rows in app.py: per-row routing, no silent fallback, legacy files unchanged."""
+class AdminSettings(unittest.TestCase):
+    def test_loads_all_sheets(self):
+        cal, fac, fn, ot, hol, warn = schedule_config.load(_tables())
+        self.assertEqual(list(cal), ["CHI", "LV", "ORL LOEWS", "ORL MARRIOTT"])
+        self.assertEqual(cal["ORL LOEWS"], {"key": "ORL LOEWS", "folder": "Orlando - Lowes", "mailbox": "loews@x.com",
+                                            "time_zone": "Eastern Standard Time", "color_by": "FACILITY",
+                                            "ot_region": "ORL"})
+        self.assertEqual(fac["HARROC"]["outlook_color"], "preset0")
+        self.assertEqual(fac["HARROC"]["excel_color"], "FF7C80")
+        self.assertIsNone(fac["MARWCR"]["outlook_color"])
+        self.assertEqual(fn, {"SET": "preset4", "STRIKE": "preset0"})
+        self.assertEqual(ot["ORL"], {"daily_hours": 8, "saturday": True, "sunday": True, "holidays": True})
+        self.assertEqual(hol["ORL"][0], "2027-01-01")
+        self.assertEqual(warn, [])
 
-    def setUp(self):
-        self.ns = _load_app_functions(
-            {"_mailbox_setting", "_mailbox_for", "_route_rows"},
-            {"_graph_cfg": lambda: {"shared_mailbox": "default@x.com"}})
-        os.environ["GRAPH_CALENDAR_MAILBOXES"] = "LOEWS_ELECTRICAL=loews@x.com"
-        os.environ["GRAPH_BRANCH_MAILBOXES"] = "ORL=orl@x.com"
+    def test_bad_rows_skipped_with_warnings(self):
+        bad = {k: (cols, [list(r) for r in rows]) for k, (cols, rows) in ADMIN.items()}
+        bad["Calendars"][1].append(["NOPE", "", "", "", "", ""])                   # no folder / time zone
+        bad["Calendars"][1].append(["X", "X", "", "Eastern Standard Time", "SHOW", ""])  # bad COLOR BY
+        bad["Facilities"][1].append(["BAD", "Bad", "", "Florida", "ORL LOEWS", "", ""])  # state not 2 letters
+        bad["Facilities"][1].append(["BAD2", "Bad", "", "FL", "ORL LOEWS", "pink", ""])  # unknown color
+        bad["Function Colors"][1].append(["PREP", "sparkly"])
+        bad["OT Rules"][1].append(["LV", "eight", "Yes", "No", "No"])
+        bad["Holidays"][1].append(["ORL", "Jan 1st", ""])
+        cal, fac, fn, ot, hol, warn = schedule_config.load(_tables(bad))
+        self.assertNotIn("NOPE", cal)
+        self.assertNotIn("X", cal)
+        self.assertNotIn("BAD", fac)
+        self.assertNotIn("PREP", fn)
+        self.assertNotIn("LV", ot)
+        self.assertEqual(len(warn), 7)
+        self.assertTrue(any("Facilities' row 10" in w and "2 letters" in w for w in warn))
 
-    def tearDown(self):
-        os.environ.pop("GRAPH_CALENDAR_MAILBOXES", None)
-        os.environ.pop("GRAPH_BRANCH_MAILBOXES", None)
+    def test_missing_sheet_and_checks(self):
+        t = _tables()
+        del t["Holidays"]
+        t["Calendars"].loc[0, "MAILBOX"] = ""
+        t["Calendars"].loc[1, "OT REGION"] = "LV"
+        t["Facilities"].loc[0, "CALENDAR"] = "GAYLORD"
+        warn = schedule_config.load(t)[5]
+        self.assertTrue(any("no 'Holidays' sheet" in w for w in warn))
+        self.assertTrue(any("CHI has no MAILBOX" in w for w in warn))
+        self.assertTrue(any("OT region LV" in w for w in warn))
+        self.assertTrue(any("calendar GAYLORD" in w for w in warn))
 
-    def test_mixed_facilities_in_one_file(self):
-        df = pd.DataFrame([{"FACILITY": "HARROC", "BRANCH": "ORL"}, {"FACILITY": "SHECHI", "BRANCH": "ORL"},
-                           {"FACILITY": "XYZ", "BRANCH": "ORL"}, {"FACILITY": "LSAPP", "BRANCH": "ORL"}])
-        mbx, err = self.ns["_route_rows"](df)
-        self.assertEqual(list(mbx), ["loews@x.com", None, None, "loews@x.com"])
-        self.assertEqual([bool(e) for e in err], [False, True, True, False])
+    def test_unreadable_workbook_keeps_last_settings(self):
+        schedule_config.apply(str(ROOT / "no such file.xlsx"))
+        try:
+            self.assertEqual(len(CALENDARS), 4)
+            self.assertIn("Could not read the admin workbook", schedule_config.CONFIG_WARNINGS[0])
+        finally:
+            _install()
 
-    def test_facility_from_another_state_is_rejected(self):
-        df = pd.DataFrame([{"FACILITY": "HARROC", "BRANCH": "LV"},    # Florida facility in the LV sheet
-                           {"FACILITY": "HILLV", "BRANCH": "ORL"},    # Nevada facility in the ORL sheet
-                           {"FACILITY": "MARWCR", "BRANCH": "ORLM"}])  # Florida in a Florida sheet: OK
-        mbx, err = self.ns["_route_rows"](df)
-        self.assertEqual(list(mbx)[:2], [None, None])
-        self.assertIn("HARROC is in FL, but this LV spreadsheet is for Nevada", err[0])
-        self.assertIn("HILLV is in NV", err[1])
-        self.assertNotIn("spreadsheet is for", err[2])  # same state: no state error
+    def test_colors_by_function_or_facility(self):
+        cat = schedule_config.event_category
+        self.assertEqual(cat("LV", "SET", "HARROC"), "SET")          # LV / CHI: by FUNCTION
+        self.assertEqual(cat("CHI", "PREP", ""), None)
+        self.assertEqual(cat("ORL LOEWS", "SET", "HARROC"), "Hard Rock")  # Orlando: by FACILITY
+        self.assertEqual(cat("ORL LOEWS", "STRIKE", "LSAPP"), "Sapphire Falls")
+        self.assertEqual(cat("ORL LOEWS", "SET", ""), None)
+        self.assertEqual(cat("ORL MARRIOTT", "SET", "MARWCR"), "SET")  # one facility: SET / STRIKE (FR-021)
+        self.assertEqual(schedule_config.outlook_categories("ORL LOEWS")["Helios"], "preset8")
+        self.assertEqual(schedule_config.outlook_categories("LV"), {"SET": "preset4", "STRIKE": "preset0"})
 
-    def test_blank_facility_goes_to_listed_city_calendar_only(self):
-        df = pd.DataFrame([{"FACILITY": "", "BRANCH": "ORL"},   # ORL listed -> city calendar
-                           {"FACILITY": "", "BRANCH": "LV"},    # LV not listed -> exception, NOT default mailbox
-                           {"FACILITY": "", "BRANCH": ""}])     # no prefix -> exception
-        mbx, err = self.ns["_route_rows"](df)
-        self.assertEqual(list(mbx), ["orl@x.com", None, None])
-        self.assertEqual(err[0], "")
-        self.assertIn("branch LV has no city calendar", err[1])
-        self.assertIn("no branch prefix", err[2])
-        self.assertNotIn("default@x.com", list(mbx))
 
-    def test_file_without_facility_column_keeps_branch_routing(self):
-        df = pd.DataFrame([{"FACILITY": None, "BRANCH": "ORL"}, {"FACILITY": None, "BRANCH": "LV"}])
-        mbx, err = self.ns["_route_rows"](df)
-        self.assertEqual(list(mbx), ["orl@x.com", "default@x.com"])
-        self.assertEqual(list(err), ["", ""])
+class Routing(unittest.TestCase):
+    def test_folder_decides_calendar(self):
+        df = pd.DataFrame([_shift("A", calendar="ORL LOEWS", facility="HARROC"),
+                           _shift("B", calendar="ORL LOEWS", facility=""),        # blank facility: still pushed
+                           _shift("C", calendar="ORL LOEWS", facility="XYZ"),     # unknown facility: still pushed
+                           _shift("D", calendar="ORL LOEWS", facility="MARWCR"),  # other calendar's facility
+                           _shift("E", calendar="CHI")])
+        mbx, err = se.route_rows(df)
+        self.assertEqual(list(mbx), ["loews@x.com"] * 4 + ["test@x.com"])
+        self.assertEqual(list(err), [""] * 5)
+        notes = se.facility_warnings(df)
+        self.assertEqual(notes[0], "")
+        self.assertEqual(notes[1], "")
+        self.assertIn("not on the admin Facilities sheet", notes[2])
+        self.assertIn("belongs to the ORL MARRIOTT calendar", notes[3])
+
+    def test_no_mailbox_unknown_calendar_and_duplicates_held_back(self):
+        CALENDARS["CHI"]["mailbox"] = None
+        try:
+            df = pd.DataFrame([_shift("A", calendar="CHI"), _shift("B", calendar="GONE"), _shift("LV-1")])
+            mbx, err = se.route_rows(df, {"LV-1"})
+        finally:
+            _install()
+        self.assertEqual(list(mbx), [None, None, None])
+        self.assertIn("no MAILBOX", err[0])
+        self.assertIn("not on the admin Calendars sheet", err[1])
+        self.assertIn("used by more than one row", err[2])
+
+    def test_duplicate_ids_in_and_across_files(self):
+        a = pd.DataFrame([_shift("LV-1"), _shift("LV-2"), _shift("LV-2")])
+        b = pd.DataFrame([_shift("LV-1"), _shift("CHI-1")])
+        self.assertEqual(se.duplicate_ids([a, b]), {"LV-1", "LV-2"})
+        self.assertEqual(se.duplicate_ids([]), set())
 
 
 class Parser(unittest.TestCase):
     def setUp(self):
-        self.ns = _load_app_functions({"_read_branch_time_zones", "_cell_text", "_read_link_urls",
-                                       "parse_lv_byDay", "_make_event_id"})
         self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "t.xlsx"
+        shutil.copy(TEMPLATE, self.path)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)  # pandas may still hold the file open on Windows
 
-    def test_template_with_facility(self):
-        path = self.tmp / "t.xlsx"
-        shutil.copy(TEMPLATE, path)
-        wb = load_workbook(path)
+    def test_formula_ids_without_saved_values(self):
+        # The template's ID column is a formula; saved by a script, Excel hasn't stored its values yet
+        wb = load_workbook(self.path)
         ws = wb["By Day"]
-        for r, code in zip(range(2, 7), ["HARROC", "helios", "", "SHECHI", "LSAPP"]):
-            ws.cell(r, 7).value = code or None
-        wb.save(path)
-        df = self.ns["parse_lv_byDay"](str(path), "By Day")
-        self.assertEqual(list(df["FACILITY"]), ["HARROC", "HELIOS", "", "SHECHI", "LSAPP"])
-        self.assertEqual(df.loc[2, "EXTRA_CREW"], 2)          # LV-0003 has '+2'
-        self.assertTrue(df.loc[0, "LINK"].startswith("https://"))  # hyperlink still read after the column insert
+        self.assertTrue(str(ws["A2"].value).startswith("=IF("))
+        ws["A5"] = "TYPED-1"   # a typed ID still wins
+        ws["G2"], ws["G3"] = "HARROC", "helios"
+        wb["Lists"]["P2"] = "ORL"
+        wb.save(self.path)
+        df = se.parse_lv_byDay(str(self.path), "By Day", "ORL LOEWS")
+        self.assertEqual(list(df["EVENT_ID"][:5]), ["ORL-0001", "ORL-0002", "ORL-0003", "TYPED-1", "ORL-0005"])
+        self.assertEqual(list(df["FACILITY"][:3]), ["HARROC", "HELIOS", ""])
+        self.assertTrue((df["CALENDAR"] == "ORL LOEWS").all())
+        self.assertTrue((df["TIME_ZONE"] == "Eastern Standard Time").all())   # from the calendar
+        self.assertEqual(df.loc[2, "EXTRA_CREW"], 2)                          # row 4 has '+2'
+        self.assertTrue(df.loc[0, "LINK"].startswith("https://"))             # URL behind the cell, by row
 
-    def test_marriott_and_chicago_prefixes_get_their_time_zones(self):
-        path = self.tmp / "t2.xlsx"
-        shutil.copy(TEMPLATE, path)
-        wb = load_workbook(path)
-        ws = wb["By Day"]
-        ws["A2"], ws["G2"] = "ORLM-0001", "MARWCR"
-        ws["A3"], ws["G3"] = "CHI-0001", "SHECHI"
-        wb.save(path)
-        df = self.ns["parse_lv_byDay"](str(path), "By Day").set_index("EVENT_ID")
-        self.assertEqual(df.loc["ORLM-0001", "TIME_ZONE"], "Eastern Standard Time")
-        self.assertEqual(df.loc["CHI-0001", "TIME_ZONE"], "Central Standard Time")
-
-    @unittest.skipUnless(OLD_TEMPLATE.exists(), "v1.0 template backup not present")
-    def test_old_template_without_facility_column(self):
-        df = self.ns["parse_lv_byDay"](str(OLD_TEMPLATE), "By Day")
-        self.assertTrue(df["FACILITY"].isna().all())
+    def test_inserted_blank_row_keeps_row_numbers(self):
+        wb = load_workbook(self.path)
+        wb["By Day"].insert_rows(3)   # empty row: its ID formula is missing too
+        wb.save(self.path)
+        df = se.parse_lv_byDay(str(self.path), "By Day", "LV")
+        self.assertEqual(list(df["EVENT_ID"][:3]), ["LV-0001", "LV-0003", "LV-0004"])  # Excel rows 2, 4, 5
 
 
 class Template(unittest.TestCase):
-    def test_dropdown_and_row_colors(self):
-        ws = load_workbook(TEMPLATE)["By Day"]
-        header = [c.value for c in ws[1]]
-        self.assertEqual(header[6], "FACILITY")
+    def test_dropdowns_row_colors_and_id_formula(self):
+        wb = load_workbook(TEMPLATE)
+        ws = wb["By Day"]
+        self.assertEqual([c.value for c in ws[1]][6], "FACILITY")
         lists = {str(d.sqref): d.formula1 for d in ws.data_validations.dataValidation}
         self.assertIn("G2:G2000", lists)
         rules = {r.formula[0]: r.dxf.fill.end_color.rgb[-6:]
                  for rs in ws.conditional_formatting._cf_rules.values() for r in rs}
         expected = {f'$G2="{c}"': f["excel_color"] for c, f in FACILITIES.items() if f["excel_color"]}
         self.assertEqual(rules, expected)
-        for tbd in ("MARWCR", "HILLV", "SHECHI"):
-            self.assertNotIn(f'$G2="{tbd}"', rules)
+        self.assertEqual(ws["A2000"].value, '=IF(C2000="","",Lists!$P$2&"-"&TEXT(ROW()-1,"0000"))')
+        self.assertEqual((wb["Lists"]["P1"].value, wb["Lists"]["P2"].value), ("ID PREFIX", "LV"))
+        text = " ".join(str(c.value or "") for c in wb["Instructions"]["A"])
+        self.assertIn("ID fills in automatically", text)
+        self.assertIn("The folder decides the Outlook calendar", text)
+        self.assertNotIn("BRANCH / STATE / TIME ZONE", text)
+
+
+class Sync(unittest.TestCase):
+    """sync_rows / remove_deleted_shifts with Graph replaced by fakes."""
+
+    def setUp(self):
+        self.cal, self.calls, self.deleted = {}, [], []
+        self.orig = {n: getattr(se, n) for n in ("build_calendar_map", "create_graph_event", "patch_graph_event",
+                                                 "delete_graph_event")}
+        se.build_calendar_map = lambda t, m, s, e: {k: dict(v) for k, v in self.cal.get(m, {}).items()}
+        se.create_graph_event = lambda t, m, p: (self.calls.append(("create", m, p)),
+                                                 types.SimpleNamespace(status_code=201))[1]
+        se.patch_graph_event = lambda t, m, g, p: (self.calls.append(("patch", m, p)),
+                                                   types.SimpleNamespace(status_code=200))[1]
+        se.delete_graph_event = lambda t, m, g: (self.deleted.append((m, g)), types.SimpleNamespace(status_code=204))[1]
+
+    def tearDown(self):
+        for n, f in self.orig.items():
+            setattr(se, n, f)
+
+    def test_past_rows_are_not_pushed(self):
+        df = pd.DataFrame([_shift("LV-1", PAST), _shift("LV-2"), _shift("LV-3", se.today().strftime("%Y-%m-%d"))])
+        stats, results, bad = se.sync_rows("t", df)
+        self.assertEqual((stats["created"], stats["past"]), (2, 1))
+        self.assertEqual([r["ID"] for r in results], ["LV-2", "LV-3"])
+
+    def test_update_skip_and_duplicates(self):
+        df = pd.DataFrame([_shift("LV-1"), _shift("LV-2"), _shift("LV-3")])
+        self.cal = {"test@x.com": {"LV-1": {"graph_id": "g1", "hash": se._field_hash(df.iloc[0])},
+                                   "LV-2": {"graph_id": "g2", "hash": "old"}}}
+        stats, _, bad = se.sync_rows("t", df, {"LV-3"})
+        self.assertEqual((stats["skipped"], stats["updated"], stats["created"]), (1, 1, 0))
+        self.assertEqual(bad, [("LV-3", "ID LV-3 is used by more than one row")])
+
+    def test_payload_colors_and_time_zone(self):
+        df = pd.DataFrame([_shift("ORL-1", calendar="ORL LOEWS", facility="HARROC"),
+                           _shift("LV-1", function="STRIKE"), _shift("LV-2", function="PREP")])
+        se.sync_rows("t", df)
+        payloads = {p["subject"] + m: p for _, m, p in self.calls}
+        cats = [p["categories"] for _, _, p in self.calls]
+        self.assertIn(["Hard Rock"], cats)
+        self.assertIn(["STRIKE"], cats)
+        self.assertIn([], cats)
+        self.assertTrue(all(p["start"]["timeZone"] == "Pacific Standard Time" for p in payloads.values()))
+
+    def test_hash_unchanged_for_uncolored_rows(self):
+        r = _shift("LV-1", function="PREP")
+        old = hashlib.md5("|".join(str(r.get(f, "")) for f in
+                                   ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8]
+        self.assertEqual(se._field_hash(r), old)       # no needless Outlook updates
+        colored = _shift("LV-1")                       # SET on LV: colored, so its hash includes the color
+        plain = hashlib.md5("|".join(str(colored.get(f, "")) for f in
+                                     ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8]
+        self.assertNotEqual(se._field_hash(colored), plain)
+
+    def files(self):
+        return {"Las Vegas/a.xlsx": pd.DataFrame([_shift("LV-1"), _shift("LV-OLD", PAST)]),
+                "Chicago/c.xlsx": pd.DataFrame([_shift("CHI-1", calendar="CHI")]),
+                "Orlando - Lowes/o.xlsx": pd.DataFrame([_shift("ORL-1", calendar="ORL LOEWS")]),
+                "Orlando Marriott/m.xlsx": pd.DataFrame([_shift("ORLM-1", calendar="ORL MARRIOTT")])}
+
+    def test_removed_and_moved_to_past_are_deleted(self):
+        self.cal = {"test@x.com": {"LV-1": {"graph_id": "g1"}, "LV-GONE": {"graph_id": "g2"},
+                                   "LV-OLD": {"graph_id": "g3"}},   # row now dated in the past
+                    "loews@x.com": {"ORL-1": {"graph_id": "g4"}}}
+        removed, problem = se.remove_deleted_shifts("t", self.files(), {})
+        self.assertEqual(problem, "")
+        self.assertEqual(sorted(self.deleted), [("test@x.com", "g2"), ("test@x.com", "g3")])
+
+    def test_no_deletes_when_a_file_cannot_be_read(self):
+        self.cal = {"test@x.com": {"LV-GONE": {"graph_id": "g2"}}}
+        removed, problem = se.remove_deleted_shifts("t", self.files(), {"Chicago/c.xlsx": "bad"})
+        self.assertEqual((removed, self.deleted), ([], []))
+        self.assertIn("could not read: Chicago/c.xlsx", problem)
+
+    def test_calendar_without_files_protects_its_mailbox(self):
+        files = self.files()
+        del files["Chicago/c.xlsx"]   # Chicago folder empty: test@x.com (shared with LV) is not cleaned
+        self.cal = {"test@x.com": {"LV-GONE": {"graph_id": "g2"}}, "loews@x.com": {"ORL-GONE": {"graph_id": "g5"}}}
+        se.remove_deleted_shifts("t", files, {})
+        self.assertEqual(self.deleted, [("loews@x.com", "g5")])
+
+    def test_same_mailbox_under_two_addresses(self):
+        ev = {"LV-1": {"graph_id": "g1"}, "LV-2": {"graph_id": "g2"}}
+        self.cal = {"a@x.com": ev, "b@x.com": ev}
+        se._delete_removed("t", {"LV-1": "b@x.com"}, {"a@x.com", "b@x.com"})
+        self.assertEqual(self.deleted, [("a@x.com", "g2")])   # LV-1 kept; LV-2 deleted once, not twice
+
+    def test_missing_permission_reports_but_does_not_raise(self):
+        orig = se.requests
+        se.requests = types.SimpleNamespace(get=lambda *a, **k: types.SimpleNamespace(status_code=403))
+        try:
+            err = se.ensure_outlook_categories("t", "loews@x.com")
+        finally:
+            se.requests = orig
+        self.assertIn("MailboxSettings.ReadWrite", err)
+        self.assertIn("Hard Rock (red)", err)
 
 
 class Overtime(unittest.TestCase):
@@ -232,31 +364,21 @@ class Overtime(unittest.TestCase):
             r = self.ot([_row(d, "08:00 - 12:00", ["Ann"])]).iloc[0]
             self.assertEqual((r.OT_HOURS, r.OT_REASON), (4.0, "Holiday"), d)
 
-    def test_holiday_on_weekend_counted_once(self):  # 2027-12-25 isn't configured; use a fake weekend holiday
-        import schedule_logic
-        orig = schedule_logic.HOLIDAYS
-        schedule_logic.HOLIDAYS = {"ORL": ["2027-01-09"]}  # a Saturday
+    def test_holiday_on_weekend_counted_once(self):
+        HOLIDAYS["ORL"].append("2027-01-09")  # a Saturday
         try:
             r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"])]).iloc[0]
         finally:
-            schedule_logic.HOLIDAYS = orig
+            _install()
         self.assertEqual((r.OT_HOURS, r.OT_REASON), (10.0, "Holiday"))
 
-    def test_marriott_uses_orlando_rules(self):
-        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="MARWCR")]).iloc[0]
+    def test_marriott_calendar_uses_orlando_rules(self):
+        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="", calendar="ORL MARRIOTT")]).iloc[0]
         self.assertEqual((r.OT_HOURS, r.OT_REASON), (10.0, "Saturday"))
 
-    def test_no_rules_region(self):
-        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="SHECHI")]).iloc[0]
+    def test_calendar_without_rules(self):
+        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="SHECHI", calendar="CHI")]).iloc[0]
         self.assertEqual((r.OT_HOURS, r.STATUS), (0.0, "no OT rules"))
-
-    def test_blank_facility_uses_branch_rules(self):
-        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility="", branch="ORL")]).iloc[0]
-        self.assertEqual((r.OT_HOURS, r.OT_REASON), (10.0, "Saturday"))
-
-    def test_legacy_file_uses_branch(self):
-        r = self.ot([_row("2027-01-09", "06:00 - 16:00", ["Ann"], facility=None, branch="ORL")]).iloc[0]
-        self.assertEqual(r.OT_HOURS, 10.0)
 
     def test_untimed_saturday_is_ot_shift_without_hours(self):
         r = self.ot([_row("2027-01-09", "", ["Ann"])]).iloc[0]
@@ -278,177 +400,6 @@ class Overtime(unittest.TestCase):
         self.assertEqual(s.loc["Ann", "OT Hours: Saturday"], 4.0)
         self.assertEqual(s.loc["Bob", "OT Hours"], 2.0)
         self.assertEqual(s["OT Hours"].sum(), ps["OT_HOURS"].sum())
-
-
-class OutlookColors(unittest.TestCase):
-    """SET / STRIKE events get an Outlook category (color); other functions don't."""
-
-    def setUp(self):
-        import hashlib, types
-        from schedule_config import OUTLOOK_CATEGORIES
-        self.sent = []
-        fake = types.SimpleNamespace(
-            post=lambda url, headers=None, json=None, timeout=None: self.sent.append(("post", url, json)),
-            patch=lambda url, headers=None, json=None, timeout=None: self.sent.append(("patch", url, json)),
-            get=lambda url, headers=None, timeout=None: types.SimpleNamespace(status_code=403, json=lambda: {}))
-        self.ns = _load_app_functions(
-            {"_field_hash", "_event_categories", "create_graph_event", "patch_graph_event", "_parse_time_range",
-             "_timed_end", "_make_body", "ensure_outlook_categories"},
-            {"hashlib": hashlib, "OUTLOOK_CATEGORIES": OUTLOOK_CATEGORIES, "requests": fake,
-             "timedelta": __import__("datetime").timedelta, "escape": __import__("html").escape})
-
-    def row(self, fn):
-        return {"DATE": "2027-01-06", "SHOW": "S", "FUNCTION": fn, "TIME": "08:00 - 12:00", "LOCATION": "",
-                "FOREMAN": "TBD", "NOTES": ""}
-
-    def test_categories_by_function(self):
-        cats = self.ns["_event_categories"]
-        self.assertEqual(cats(self.row("SET")), ["SET"])
-        self.assertEqual(cats(self.row("STRIKE")), ["STRIKE"])
-        self.assertEqual(cats(self.row("BOOTH CHECK")), [])
-        self.assertEqual(cats(self.row("SET/STRIKE")), [])
-
-    def test_hash_unchanged_for_uncolored_functions(self):
-        import hashlib
-        r = self.row("PREP")
-        old = hashlib.md5("|".join(str(r.get(f, "")) for f in
-                                   ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8]
-        self.assertEqual(self.ns["_field_hash"](r), old)           # no needless Outlook updates
-        self.assertNotEqual(self.ns["_field_hash"](self.row("SET")),
-                            hashlib.md5("|".join(str(self.row("SET").get(f, "")) for f in
-                                                 ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8])
-
-    def test_payload_carries_categories(self):
-        ts = pd.Timestamp("2027-01-06")
-        self.ns["create_graph_event"]("t", "m@x.com", "S - SET", ts, ts, time_str="08:00 - 12:00", categories=["SET"])
-        self.ns["patch_graph_event"]("t", "m@x.com", "gid", ts, ts, time_str="08:00 - 12:00")
-        self.assertEqual(self.sent[0][2]["categories"], ["SET"])
-        self.assertEqual(self.sent[1][2]["categories"], [])        # function changed away from SET: color removed
-
-    def test_missing_permission_reports_but_does_not_raise(self):
-        err = self.ns["ensure_outlook_categories"]("t", "m@x.com")
-        self.assertIn("MailboxSettings.ReadWrite", err)
-        self.assertIn("SET (green)", err)
-        self.assertIn("STRIKE (red)", err)
-
-
-class RemovedShifts(unittest.TestCase):
-    """_delete_removed: a shift deleted from Excel leaves Outlook, wherever it is on the calendar."""
-
-    def setUp(self):
-        import types
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
-        self.cal, self.queried, self.deleted = {}, [], []
-
-        def fake_map(token, mbx, start, end):
-            self.queried.append((mbx, start, end))
-            return {e: dict(x) for e, x in self.cal.get(mbx, {}).items()}
-
-        def fake_delete(token, mbx, gid):
-            self.deleted.append((mbx, gid))
-            return types.SimpleNamespace(status_code=204)
-
-        self.ns = _load_app_functions(
-            {"_delete_removed", "_all_calendar_mailboxes", "_mailbox_setting"},
-            {"build_calendar_map": fake_map, "delete_graph_event": fake_delete, "dt": datetime,
-             "timedelta": timedelta, "_PT": ZoneInfo("America/Los_Angeles"),
-             "_graph_cfg": lambda: {"shared_mailbox": "default@x.com"}})
-
-    def run_delete(self, keep, mailboxes=("a@x.com", "b@x.com")):
-        return self.ns["_delete_removed"]("t", keep, set(mailboxes))
-
-    def test_removed_row_deleted_kept_row_stays(self):
-        self.cal = {"a@x.com": {"LV-1": {"graph_id": "g1", "hash": ""}, "LV-2": {"graph_id": "g2", "hash": ""}}}
-        out = self.run_delete({"LV-1": "a@x.com"})
-        self.assertEqual(out, [("LV-2", "a@x.com", True)])
-        self.assertEqual(self.deleted, [("a@x.com", "g2")])
-
-    def test_checks_every_calendar_from_today_18_months(self):
-        # The last shift of the file, or a facility's only shift, is outside the file's own date range
-        self.cal = {"b@x.com": {"CHI-9": {"graph_id": "g9", "hash": ""}}}
-        self.run_delete({"LV-1": "a@x.com"})
-        self.assertEqual(self.deleted, [("b@x.com", "g9")])
-        self.assertEqual({m for m, _, _ in self.queried}, {"a@x.com", "b@x.com"})
-        _, start, end = self.queried[0]
-        self.assertEqual(start, pd.Timestamp(pd.Timestamp.now(tz="America/Los_Angeles").date()))
-        self.assertEqual((end - start).days, 548)
-
-    def test_row_moved_to_other_calendar_deleted_from_old(self):
-        self.cal = {"a@x.com": {"ORL-1": {"graph_id": "g1", "hash": ""}}}
-        self.run_delete({"ORL-1": "b@x.com"})
-        self.assertEqual(self.deleted, [("a@x.com", "g1")])
-
-    def test_unroutable_row_is_kept(self):
-        self.cal = {"a@x.com": {"ORL-1": {"graph_id": "g1", "hash": ""}}}
-        self.assertEqual(self.run_delete({"ORL-1": None}), [])
-
-    def test_same_mailbox_under_two_addresses(self):
-        # The test calendar is reachable as @ges.com and @viadcorp: the same event is not 'moved'
-        ev = {"LV-1": {"graph_id": "g1", "hash": ""}, "LV-2": {"graph_id": "g2", "hash": ""}}
-        self.cal = {"a@x.com": ev, "b@x.com": ev}
-        self.run_delete({"LV-1": "b@x.com"})
-        self.assertEqual(self.deleted, [("a@x.com", "g2")])   # LV-1 kept; LV-2 deleted once, not twice
-
-    def test_all_calendar_mailboxes(self):
-        os.environ["GRAPH_CALENDAR_MAILBOXES"] = "LOEWS_ELECTRICAL=loews@x.com; LV_ELECTRICAL=default@x.com"
-        os.environ["GRAPH_BRANCH_MAILBOXES"] = "ORL=orl@x.com"
-        try:
-            self.assertEqual(self.ns["_all_calendar_mailboxes"](), {"loews@x.com", "default@x.com", "orl@x.com"})
-        finally:
-            os.environ.pop("GRAPH_CALENDAR_MAILBOXES", None)
-            os.environ.pop("GRAPH_BRANCH_MAILBOXES", None)
-
-
-class SettingsParsing(unittest.TestCase):
-    """schedule_config.load: one app setting per item, bad ones skipped with a warning."""
-
-    def load(self, settings):
-        import schedule_config
-        return schedule_config.load(settings)
-
-    def test_loads_all_kinds(self):
-        fac, br, ot, hol, cat, warn = self.load({
-            "FACILITY_GAYPAL": "Gaylord Palms; Orlando; fl; gaylord; #66cc66; orl",
-            "BRANCH_NSH": "Tennessee; TN; Central Standard Time",
-            "OT_RULES_ORL": "8; Saturday; Sunday; Holidays",
-            "HOLIDAYS_ORL": "2027-01-01, 2027-12-24",
-            "OUTLOOK_COLOR_BOOTH_CHECK": "Blue"})
-        self.assertEqual(fac["GAYPAL"], {"name": "Gaylord Palms", "city": "Orlando", "state": "FL",
-                                         "calendar": "GAYLORD", "excel_color": "66CC66", "ot_region": "ORL"})
-        self.assertEqual(br["NSH"]["state_code"], "TN")
-        self.assertEqual(ot["ORL"], {"daily_hours": 8, "saturday": True, "sunday": True, "holidays": True})
-        self.assertEqual(hol["ORL"], ["2027-01-01", "2027-12-24"])
-        self.assertEqual(cat["BOOTH CHECK"], {"name": "BOOTH CHECK", "color": "preset7"})
-        self.assertEqual(warn, [])
-
-    def test_blank_parts_mean_not_provided(self):
-        fac = self.load({"FACILITY_HILLV": "Westgate; Las Vegas; NV; LV_ELECTRICAL; ; "})[0]
-        self.assertIsNone(fac["HILLV"]["excel_color"])
-        self.assertIsNone(fac["HILLV"]["ot_region"])
-
-    def test_bad_settings_are_skipped_with_warnings(self):
-        fac, br, ot, hol, cat, warn = self.load({
-            "FACILITY_GOOD": "Good; Orlando; FL; LOEWS_ELECTRICAL; ; ",
-            "FACILITY_BAD1": "Bad; Orlando; Florida; X; ; ",        # state not 2 letters
-            "FACILITY_BAD2": "Bad; Orlando; FL; X; pink; ",          # color not hex
-            "BRANCH_X": "Nevada; NV",                                # missing time zone
-            "OT_RULES_X": "Saturday; Sunday",                        # no daily hours
-            "HOLIDAYS_X": "Jan 1",                                   # bad date
-            "OUTLOOK_COLOR_SET": "sparkly"})                         # unknown color
-        self.assertEqual(list(fac), ["GOOD"])
-        self.assertEqual((br, ot, hol, cat), ({}, {}, {}, {}))
-        self.assertEqual(len(warn), 6)
-        self.assertTrue(any("FACILITY_BAD1" in w and "2 letters" in w for w in warn))
-
-    def test_missing_facilities_and_ot_region_warn(self):
-        warn = self.load({"FACILITY_A": "A; X; FL; CAL; ; NOPE"})[5]
-        self.assertTrue(any("OT_RULES_NOPE" in w for w in warn))
-        self.assertTrue(any("No FACILITY_" in w for w in self.load({})[5]))
-
-    def test_test_settings_match_the_business_list(self):
-        self.assertEqual(sorted(FACILITIES), ["HARROC", "HELIOS", "HILLV", "LSAPP", "MARWCR", "PORBAY",
-                                              "ROYPAC", "SHECHI"])
 
 
 if __name__ == "__main__":
