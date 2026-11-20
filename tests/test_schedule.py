@@ -326,6 +326,57 @@ class Sync(unittest.TestCase):
         self.assertIn("Hard Rock (red)", err)
 
 
+class OutlookView(unittest.TestCase):
+    PAGE1 = {"value": [
+        {"subject": "Show A - SET", "isAllDay": False, "categories": ["SET"],
+         "start": {"dateTime": "2027-01-05T07:00:00.0000000"}, "end": {"dateTime": "2027-01-05T15:00:00.0000000"},
+         "location": {"displayName": "Hall C"}, "lastModifiedDateTime": "2027-01-02T18:30:00.1234567Z",
+         "body": {"content": "GES_ID:LV-0001|GES_HASH:abc\r\nForeman: Bob. Bring lifts"}}],
+        "@odata.nextLink": "next"}
+    PAGE2 = {"value": [
+        {"subject": "Show B - STRIKE", "isAllDay": True, "categories": [],
+         "start": {"dateTime": "2027-01-05T00:00:00.0000000"}, "end": {"dateTime": "2027-01-07T00:00:00.0000000"},
+         "body": {"content": "typed in Outlook"}}]}
+
+    def read(self, pages):
+        calls, orig = [], se.requests
+        def get(url, headers=None, params=None, timeout=None):
+            calls.append((url, headers, params))
+            p = pages.pop(0)
+            return types.SimpleNamespace(status_code=p.get("status", 200), json=lambda: p)
+        se.requests = types.SimpleNamespace(get=get)
+        try:
+            out = se.read_calendar_events("t", "lv@x.com", pd.Timestamp("2027-01-01"), pd.Timestamp("2027-01-31"),
+                                          "Pacific Standard Time")
+        finally:
+            se.requests = orig
+        return out, calls
+
+    def test_reads_all_pages_in_the_calendar_time_zone(self):
+        (events, err), calls = self.read([dict(self.PAGE1), dict(self.PAGE2)])
+        self.assertEqual(err, "")
+        self.assertEqual(len(calls), 2)
+        self.assertIn('outlook.timezone="Pacific Standard Time"', calls[0][1]["Prefer"])
+        self.assertIsNone(calls[1][2])  # the next page link already has the query
+        a, b = events
+        self.assertEqual((a["EVENT_ID"], a["NOTES"], a["LOCATION"]), ("LV-0001", "Foreman: Bob. Bring lifts", "Hall C"))
+        self.assertEqual(a["START"], pd.Timestamp("2027-01-05 07:00"))
+        self.assertEqual(str(a["MODIFIED"].tz), "UTC")
+        self.assertEqual((b["EVENT_ID"], b["NOTES"], b["MODIFIED"]), ("", "typed in Outlook", None))
+
+    def test_error_is_reported(self):
+        (events, err), _ = self.read([{"status": 403}])
+        self.assertEqual(events, [])
+        self.assertIn("403", err)
+
+    def test_events_on_day(self):
+        (events, _), _ = self.read([dict(self.PAGE1), dict(self.PAGE2)])
+        day5 = se.events_on_day(events, "2027-01-05")
+        self.assertEqual([e["SUBJECT"] for e in day5], ["Show B - STRIKE", "Show A - SET"])  # all-day first
+        self.assertEqual([e["SUBJECT"] for e in se.events_on_day(events, "2027-01-06")], ["Show B - STRIKE"])
+        self.assertEqual(se.events_on_day(events, "2027-01-07"), [])  # all-day end is exclusive
+
+
 class Overtime(unittest.TestCase):
     def ot(self, rows):
         return compute_overtime(pd.DataFrame(rows))

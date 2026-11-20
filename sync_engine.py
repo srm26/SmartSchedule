@@ -152,6 +152,51 @@ def build_calendar_map(token, mailbox, start_date, end_date):
     return mapping
 
 
+def read_calendar_events(token, mailbox, start_date, end_date, time_zone):
+    """Read-only: every Outlook event from start_date through end_date, times in `time_zone`.
+    Returns (events, error). Each event: SUBJECT, START, END (end is exclusive), ALL_DAY, LOCATION,
+    CATEGORIES, EVENT_ID (app ID or ''), NOTES (body text without the app's ID line), MODIFIED (UTC)."""
+    params = {
+        "startDateTime": (start_date - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"),  # pad for time zones
+        "endDateTime":   (end_date + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z"),
+        "$select": "subject,start,end,isAllDay,location,categories,body,lastModifiedDateTime",
+        "$orderby": "start/dateTime",
+        "$top": "500",
+    }
+    headers = {"Authorization": f"Bearer {token}",
+               "Prefer": f"outlook.timezone=\"{time_zone}\", outlook.body-content-type=\"text\""}
+    events, next_url = [], f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
+    while next_url:
+        resp = requests.get(next_url, headers=headers, params=params, timeout=15)
+        if resp.status_code != 200:
+            return events, f"could not read the Outlook calendar of {mailbox} ({resp.status_code})"
+        data = resp.json()
+        for e in data.get("value", []):
+            body = (e.get("body") or {}).get("content", "")
+            eid, _ = _parse_body(body)
+            events.append({
+                "SUBJECT":    e.get("subject") or "(no title)",
+                "START":      pd.Timestamp(e["start"]["dateTime"][:19]),
+                "END":        pd.Timestamp(e["end"]["dateTime"][:19]),
+                "ALL_DAY":    bool(e.get("isAllDay")),
+                "LOCATION":   (e.get("location") or {}).get("displayName", ""),
+                "CATEGORIES": e.get("categories") or [],
+                "EVENT_ID":   eid,
+                "NOTES":      "\n".join(l for l in body.splitlines() if not l.strip().startswith("GES_ID:")).strip(),
+                "MODIFIED":   pd.Timestamp(e["lastModifiedDateTime"]) if e.get("lastModifiedDateTime") else None,
+            })
+        next_url, params = data.get("@odata.nextLink"), None
+    return events, ""
+
+
+def events_on_day(events, day):
+    """Events that show on `day` (an event spanning several days shows on each), all-day first, then by time."""
+    day = pd.Timestamp(day).normalize()
+    hits = [e for e in events
+            if e["START"] < day + timedelta(days=1) and (e["END"] > day or e["START"] == e["END"] == day)]
+    return sorted(hits, key=lambda e: (not e["ALL_DAY"], e["START"]))
+
+
 # ─── GRAPH HELPERS ───────────────────────────────────────────────────
 def _graph_cfg():
     """Graph credentials from env vars (App Service) or .streamlit/secrets.toml [graph] (local)."""

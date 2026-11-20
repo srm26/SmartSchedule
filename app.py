@@ -7,13 +7,16 @@ The 15-minute Outlook sync runs on its own (sync_engine.py, started by startup.s
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import calendar as pycal
 from datetime import timedelta
+from html import escape
 
-from schedule_config import CALENDARS, FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, CONFIG_WARNINGS
+from schedule_config import CALENDARS, FACILITIES, OT_RULES, HOLIDAYS, DT_RULES, CONFIG_WARNINGS, outlook_categories
 from schedule_logic import compute_overtime, ot_summary
 from sync_engine import (graph_secrets_ok, get_graph_token, load_all, duplicate_ids, route_rows,
                          facility_warnings, sync_rows, remove_deleted_shifts, ensure_outlook_categories,
-                         sweep_status, sweep_test_rows, set_sweep_test_rows, today, SYNC_MINUTES)
+                         sweep_status, sweep_test_rows, set_sweep_test_rows, today, SYNC_MINUTES,
+                         read_calendar_events, events_on_day)
 import requests
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────
@@ -129,6 +132,17 @@ def _load_sharepoint():
     files, parsed, errors, _ = load_all(get_graph_token())
     return files, parsed, errors
 
+@st.cache_data(ttl=60, show_spinner="Reading the Outlook calendar...")
+def _read_outlook(mailbox, start, end, time_zone):
+    """Events in the calendar's mailbox (read-only), kept 1 minute; 'Reload from Outlook' clears it."""
+    return read_calendar_events(get_graph_token(), mailbox, start, end, time_zone)
+
+# Outlook color category (preset) -> event fill on the Outlook Calendar page
+OUTLOOK_FILL = {"preset0": "#f7b9b9", "preset1": "#fcd3a5", "preset2": "#dcc0a3", "preset3": "#fbeea0",
+                "preset4": "#bfe5bf", "preset5": "#a9e2df", "preset6": "#d8db9f", "preset7": "#b7d5fb",
+                "preset8": "#d9c2f3", "preset9": "#f1aac4", "preset12": "#d9d9d9"}
+DEFAULT_FILL = "#dbe4f0"
+
 if not graph_secrets_ok():
     st.error("Microsoft Graph credentials are not configured (GRAPH_APP_ID, GRAPH_TENANT_ID, GRAPH_CLIENT_SECRET), "
              "so SharePoint can't be read.")
@@ -159,7 +173,7 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigation",
-        ["Dashboard", "Schedule & Push", "Calendar View", "Crew Lookup", "Overtime"],
+        ["Dashboard", "Schedule & Push", "Calendar View", "Outlook Calendar", "Crew Lookup", "Overtime"],
         key="nav", label_visibility="collapsed",
     )
 
@@ -439,6 +453,109 @@ elif "Schedule" in page:
 # ═══════════════════════════════════════════════════════════════════
 # PAGE: CALENDAR VIEW
 # ═══════════════════════════════════════════════════════════════════
+elif page == "Outlook Calendar":
+    st.markdown('<div class="section-title">Outlook Calendar (read-only)</div>', unsafe_allow_html=True)
+    st.caption("What Outlook has right now, read straight from the calendar's mailbox. Nothing here changes Outlook. "
+               "Hover over an event to see its notes, or pick a day below for full details.")
+
+    _cals = [k for k, c in CALENDARS.items() if c["mailbox"]]
+    if not _cals:
+        st.info("No calendar has a MAILBOX on the admin Calendars sheet.")
+        st.stop()
+    if "oc_day" not in st.session_state:
+        st.session_state.oc_day = today().date()
+
+    def _oc_shift_month(step):
+        d = pd.Timestamp(st.session_state.oc_day).replace(day=1) + pd.DateOffset(months=step)
+        st.session_state.oc_day = d.date()
+
+    c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 2])
+    with c1:
+        oc_cal = st.selectbox("Calendar", _cals, index=_cals.index(view) if view in _cals else 0, key="oc_cal")
+    with c2:
+        st.button("◀ Prev month", on_click=_oc_shift_month, args=(-1,), use_container_width=True)
+    with c3:
+        st.button("Today", on_click=lambda: st.session_state.update(oc_day=today().date()), use_container_width=True)
+    with c4:
+        st.button("Next month ▶", on_click=_oc_shift_month, args=(1,), use_container_width=True)
+    with c5:
+        if st.button("Reload from Outlook", use_container_width=True):
+            _read_outlook.clear()
+
+    cal_cfg = CALENDARS[oc_cal]
+    sel_day = pd.Timestamp(st.session_state.oc_day)
+    month1  = sel_day.replace(day=1)
+    weeks   = pycal.Calendar(firstweekday=6).monthdatescalendar(month1.year, month1.month)  # weeks start Sunday
+    events, oc_err = _read_outlook(cal_cfg["mailbox"], pd.Timestamp(weeks[0][0]), pd.Timestamp(weeks[-1][-1]),
+                                   cal_cfg["time_zone"])
+    if oc_err:
+        st.error(oc_err)
+    st.markdown(f"### {month1.strftime('%B %Y')}")
+    st.caption(f"Mailbox **{cal_cfg['mailbox']}** · times in {cal_cfg['time_zone']} · "
+               f"read at {pd.Timestamp.now(tz='America/Los_Angeles').strftime('%I:%M %p').lstrip('0')} PT")
+
+    cat_colors = {name: OUTLOOK_FILL.get(preset, DEFAULT_FILL) for name, preset in outlook_categories(oc_cal).items()}
+
+    def _when(e):
+        if e["ALL_DAY"]:
+            return "All day"
+        return e["START"].strftime("%I:%M %p").lstrip("0")
+
+    cells = []
+    for week in weeks:
+        row = []
+        for d in week:
+            d = pd.Timestamp(d)
+            chips = []
+            for e in events_on_day(events, d):
+                fill = next((cat_colors[c] for c in e["CATEGORIES"] if c in cat_colors), DEFAULT_FILL)
+                tip  = "\n".join(x for x in [f"{_when(e)}  {e['SUBJECT']}", e["LOCATION"], e["NOTES"]] if x)
+                label = e["SUBJECT"] if e["ALL_DAY"] else f"{_when(e)} {e['SUBJECT']}"
+                chips.append(f'<div class="oc-ev" style="background:{fill}" title="{escape(tip)}">{escape(label)}</div>')
+            cls = "oc-day" + (" oc-out" if d.month != month1.month else "") \
+                + (" oc-today" if d == today() else "") + (" oc-sel" if d == sel_day else "")
+            row.append(f'<td class="{cls}"><div class="oc-num">{d.day}</div>{"".join(chips)}</td>')
+        cells.append("<tr>" + "".join(row) + "</tr>")
+    heads = "".join(f"<th>{n}</th>" for n in ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])
+    st.markdown(f"""
+<style>
+  .oc-tbl {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+  .oc-tbl th {{ font-size:12px; color:#64748b; font-weight:600; text-align:left; padding:4px 6px; }}
+  .oc-day {{ border:1px solid #e2e8f0; vertical-align:top; height:120px; padding:4px; }}
+  .oc-day > div.oc-num {{ font-size:13px; font-weight:600; color:#1e293b; margin-bottom:2px; }}
+  .oc-out {{ background:#f8fafc; }} .oc-out > div.oc-num {{ color:#94a3b8; }}
+  .oc-today > div.oc-num {{ background:#2563eb; color:#fff; border-radius:10px; display:inline-block; padding:0 7px; }}
+  .oc-sel {{ outline:2px solid #f59e0b; outline-offset:-2px; }}
+  .oc-ev {{ font-size:11px; color:#1e293b; border-radius:3px; padding:1px 4px; margin-bottom:2px;
+           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:default; }}
+</style>
+<table class="oc-tbl"><tr>{heads}</tr>{"".join(cells)}</table>""", unsafe_allow_html=True)
+
+    if cat_colors:
+        st.markdown(" ".join(f'<span class="oc-ev" style="background:{c};display:inline-block;padding:2px 8px">'
+                             f'{escape(n)}</span>' for n, c in cat_colors.items()), unsafe_allow_html=True)
+
+    # ── One day's events, with the full notes ─────────────────────────
+    st.divider()
+    st.date_input("Show the events of", key="oc_day", format="MM/DD/YYYY")
+    day_events = events_on_day(events, sel_day)
+    if not day_events:
+        st.caption(f"No events on {sel_day.strftime('%A %B %d, %Y')}.")
+    for e in day_events:
+        if e["ALL_DAY"]:
+            last = e["END"] - timedelta(days=1)
+            span = "All day" + (f", through {last.strftime('%a %b %d')}" if last > e["START"] else "")
+        else:
+            span = f"{e['START'].strftime('%a %b %d %I:%M %p')} – {e['END'].strftime('%a %b %d %I:%M %p')}"
+        with st.expander(f"{_when(e)} · {e['SUBJECT']}", expanded=len(day_events) <= 3):
+            st.markdown(f"**When:** {span}  \n**Location:** {e['LOCATION'] or '—'}  \n"
+                        f"**Color category:** {', '.join(e['CATEGORIES']) or '—'}  \n"
+                        f"**Schedule ID:** {e['EVENT_ID'] or '— (not created by the app)'}  \n"
+                        f"**Last changed in Outlook:** "
+                        + (e["MODIFIED"].tz_convert("America/Los_Angeles").strftime("%b %d, %Y %I:%M %p") + " PT"
+                           if e["MODIFIED"] is not None else "—"))
+            st.text(e["NOTES"] or "(no notes)")
+
 elif "Calendar" in page:
     st.markdown('<div class="section-title">Labor Calendar</div>', unsafe_allow_html=True)
     st.caption(f"Source: **{view_label}** · {stype}")
