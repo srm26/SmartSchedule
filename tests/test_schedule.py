@@ -364,6 +364,19 @@ class OutlookView(unittest.TestCase):
         self.assertEqual(str(a["MODIFIED"].tz), "UTC")
         self.assertEqual((b["EVENT_ID"], b["NOTES"], b["MODIFIED"]), ("", "typed in Outlook", None))
 
+    def test_calendar_map_finds_evening_shift_on_last_day(self):
+        # ORLM-0004: Jan 19 at 8 PM Eastern starts at 01:00 UTC on Jan 20
+        calls, orig = [], se.requests
+        def get(url, headers=None, params=None, timeout=None):
+            calls.append(params)
+            return types.SimpleNamespace(status_code=200, json=lambda: {"value": []})
+        se.requests = types.SimpleNamespace(get=get)
+        try:
+            se.build_calendar_map("t", "orl@x.com", pd.Timestamp("2027-01-05"), pd.Timestamp("2027-01-19"))
+        finally:
+            se.requests = orig
+        self.assertGreater(calls[0]["endDateTime"], "2027-01-20T01:00:00Z")
+
     def test_error_is_reported(self):
         (events, err), _ = self.read([{"status": 403}])
         self.assertEqual(events, [])

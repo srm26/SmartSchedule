@@ -133,7 +133,8 @@ def build_calendar_map(token, mailbox, start_date, end_date):
     url    = f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
     params = {
         "startDateTime": start_date.strftime("%Y-%m-%dT00:00:00Z"),
-        "endDateTime":   (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"),
+        # +2 days: an evening shift on the last day starts after midnight UTC (US time zones are behind UTC)
+        "endDateTime":   (end_date + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z"),
         "$select": "id,body",
         "$top": "500",
     }
