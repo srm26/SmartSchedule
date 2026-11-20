@@ -11,6 +11,9 @@ SmartSchedule settings, kept by an admin in the Excel workbook ADMIN_FILE on Sha
   Function Colors  FUNCTION | OUTLOOK COLOR
   OT Rules         OT REGION | DAILY HOURS | SATURDAY | SUNDAY | HOLIDAYS      (Yes / No)
   Holidays         OT REGION | DATE | HOLIDAY
+  Alerts           ADMIN EMAIL | SEND FROM
+      One admin email per row; new auto-sync problems are emailed to all of them. SEND FROM (first filled
+      cell) is the mailbox the email is sent from; the app needs the Mail.Send permission for it.
 
 Outlook colors: red, orange, brown, yellow, green, teal, olive, blue, purple, cranberry, gray.
 The app re-reads the workbook on every sync. Rows that can't be read are skipped and listed in CONFIG_WARNINGS.
@@ -27,12 +30,14 @@ SHEETS = {
     "Function Colors": ["FUNCTION", "OUTLOOK COLOR"],
     "OT Rules":        ["OT REGION", "DAILY HOURS", "SATURDAY", "SUNDAY", "HOLIDAYS"],
     "Holidays":        ["OT REGION", "DATE", "HOLIDAY"],
+    "Alerts":          ["ADMIN EMAIL", "SEND FROM"],
 }
 COLORS = {"red": "preset0", "orange": "preset1", "brown": "preset2", "yellow": "preset3",
           "green": "preset4", "teal": "preset5", "olive": "preset6", "blue": "preset7",
           "purple": "preset8", "cranberry": "preset9", "gray": "preset12", "grey": "preset12"}
 
 CALENDARS, FACILITIES, FUNCTION_COLORS, OT_RULES, HOLIDAYS, CONFIG_WARNINGS = {}, {}, {}, {}, {}, []
+ALERTS = {"to": [], "sender": ""}
 # Double-time: TBD - business rules not provided yet, so double-time is not calculated.
 DT_RULES = {}
 
@@ -57,8 +62,10 @@ def _yes(v):
 
 
 def load(tables):
-    """tables: {sheet name: DataFrame}. Returns (calendars, facilities, function_colors, ot_rules, holidays, warnings)."""
+    """tables: {sheet name: DataFrame}.
+    Returns (calendars, facilities, function_colors, ot_rules, holidays, warnings, alerts)."""
     cal, fac, fn, ot, hol, warn = {}, {}, {}, {}, {}, []
+    alerts = {"to": [], "sender": ""}
 
     def rows(sheet):
         df = tables.get(sheet)
@@ -125,8 +132,16 @@ def load(tables):
             raise ValueError(f"needs OT REGION and a DATE like 2027-01-01 (got '{r['DATE']}')")
         hol.setdefault(r["OT REGION"].upper(), []).append(r["DATE"][:10])
 
+    def alert(r):
+        for col in ("ADMIN EMAIL", "SEND FROM"):
+            if r[col] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", r[col]):
+                raise ValueError(f"{col} '{r[col]}' is not an email address")
+        if r["ADMIN EMAIL"]:
+            alerts["to"].append(r["ADMIN EMAIL"])
+        alerts["sender"] = alerts["sender"] or r["SEND FROM"]
+
     for sheet, fill in [("Calendars", calendar), ("Facilities", facility), ("Function Colors", function_color),
-                        ("OT Rules", ot_rule), ("Holidays", holiday)]:
+                        ("OT Rules", ot_rule), ("Holidays", holiday), ("Alerts", alert)]:
         each(sheet, fill)
 
     if not cal:
@@ -139,7 +154,9 @@ def load(tables):
     for code, f in fac.items():
         if f["calendar"] and f["calendar"] not in cal:
             warn.append(f"Facility {code} names calendar {f['calendar']}, which is not on the Calendars sheet.")
-    return cal, fac, fn, ot, hol, warn
+    if "Alerts" in tables and not (alerts["to"] and alerts["sender"]):
+        warn.append("Problems are not emailed: the Alerts sheet needs at least one ADMIN EMAIL and a SEND FROM mailbox.")
+    return cal, fac, fn, ot, hol, warn, alerts
 
 
 def read(src):
@@ -158,6 +175,8 @@ def apply(src):
         target.clear()
         target.update(value)
     CONFIG_WARNINGS[:] = new[5]
+    ALERTS.clear()
+    ALERTS.update(new[6])
 
 
 def outlook_categories(calendar):

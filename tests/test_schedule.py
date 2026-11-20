@@ -42,6 +42,7 @@ ADMIN = {
     "OT Rules": (["OT REGION", "DAILY HOURS", "SATURDAY", "SUNDAY", "HOLIDAYS"], [["ORL", "8", "Yes", "Yes", "Yes"]]),
     "Holidays": (["OT REGION", "DATE", "HOLIDAY"], [["ORL", d, ""] for d in
                  ["2027-01-01", "2027-01-18", "2027-02-15", "2027-05-31", "2027-07-05", "2027-11-25", "2027-12-24"]]),
+    "Alerts": (["ADMIN EMAIL", "SEND FROM"], [["admin1@x.com", "test@x.com"], ["admin2@x.com", ""]]),
 }
 
 
@@ -57,6 +58,8 @@ def _install(admin=ADMIN):
         target.clear()
         target.update(value)
     schedule_config.CONFIG_WARNINGS[:] = new[5]
+    schedule_config.ALERTS.clear()
+    schedule_config.ALERTS.update(new[6])
 
 
 _install()
@@ -72,13 +75,13 @@ def _row(date, time, crew, extra=0, facility="HARROC", eid=None, calendar="ORL L
 
 def _shift(eid, date=FUTURE, calendar="LV", function="SET", facility=""):
     return {"EVENT_ID": eid, "DATE": pd.Timestamp(date), "END_DATE": pd.NaT, "SHOW": "S", "FUNCTION": function,
-            "LOCATION": "", "TIME": "08:00 - 12:00", "FOREMAN": "TBD", "NOTES": "", "LINK": "", "LINK_TEXT": "",
+            "LOCATION": "", "TIME": "08:00 - 12:00", "FOREMAN": "TBD", "NOTES": "", "LINKS": [],
             "FACILITY": facility, "CALENDAR": calendar, "TIME_ZONE": "Pacific Standard Time"}
 
 
 class AdminSettings(unittest.TestCase):
     def test_loads_all_sheets(self):
-        cal, fac, fn, ot, hol, warn = schedule_config.load(_tables())
+        cal, fac, fn, ot, hol, warn, alerts = schedule_config.load(_tables())
         self.assertEqual(list(cal), ["CHI", "LV", "ORL LOEWS", "ORL MARRIOTT"])
         self.assertEqual(cal["ORL LOEWS"], {"key": "ORL LOEWS", "folder": "Orlando - Lowes", "mailbox": "loews@x.com",
                                             "time_zone": "Eastern Standard Time", "color_by": "FACILITY",
@@ -89,6 +92,7 @@ class AdminSettings(unittest.TestCase):
         self.assertEqual(fn, {"SET": "preset4", "STRIKE": "preset0"})
         self.assertEqual(ot["ORL"], {"daily_hours": 8, "saturday": True, "sunday": True, "holidays": True})
         self.assertEqual(hol["ORL"][0], "2027-01-01")
+        self.assertEqual(alerts, {"to": ["admin1@x.com", "admin2@x.com"], "sender": "test@x.com"})
         self.assertEqual(warn, [])
 
     def test_bad_rows_skipped_with_warnings(self):
@@ -100,13 +104,15 @@ class AdminSettings(unittest.TestCase):
         bad["Function Colors"][1].append(["PREP", "sparkly"])
         bad["OT Rules"][1].append(["LV", "eight", "Yes", "No", "No"])
         bad["Holidays"][1].append(["ORL", "Jan 1st", ""])
-        cal, fac, fn, ot, hol, warn = schedule_config.load(_tables(bad))
+        bad["Alerts"][1].append(["not an email", ""])
+        cal, fac, fn, ot, hol, warn, alerts = schedule_config.load(_tables(bad))
         self.assertNotIn("NOPE", cal)
         self.assertNotIn("X", cal)
         self.assertNotIn("BAD", fac)
         self.assertNotIn("PREP", fn)
         self.assertNotIn("LV", ot)
-        self.assertEqual(len(warn), 7)
+        self.assertEqual(len(alerts["to"]), 2)
+        self.assertEqual(len(warn), 8)
         self.assertTrue(any("Facilities' row 10" in w and "2 letters" in w for w in warn))
 
     def test_missing_sheet_and_checks(self):
@@ -120,6 +126,9 @@ class AdminSettings(unittest.TestCase):
         self.assertTrue(any("CHI has no MAILBOX" in w for w in warn))
         self.assertTrue(any("OT region LV" in w for w in warn))
         self.assertTrue(any("calendar GAYLORD" in w for w in warn))
+        t = _tables()
+        t["Alerts"].loc[:, "SEND FROM"] = ""
+        self.assertTrue(any("not emailed" in w for w in schedule_config.load(t)[5]))
 
     def test_unreadable_workbook_keeps_last_settings(self):
         schedule_config.apply(str(ROOT / "no such file.xlsx"))
@@ -167,7 +176,7 @@ class Routing(unittest.TestCase):
         self.assertEqual(list(mbx), [None, None, None])
         self.assertIn("no MAILBOX", err[0])
         self.assertIn("not on the admin Calendars sheet", err[1])
-        self.assertIn("used by more than one row", err[2])
+        self.assertIn("same DATE, TIME, SHOW, FUNCTION, FACILITY and LOCATION", err[2])
 
     def test_duplicate_ids_in_and_across_files(self):
         a = pd.DataFrame([_shift("LV-1"), _shift("LV-2"), _shift("LV-2")])
@@ -185,48 +194,78 @@ class Parser(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)  # pandas may still hold the file open on Windows
 
-    def test_formula_ids_without_saved_values(self):
-        # The template's ID column is a formula; saved by a script, Excel hasn't stored its values yet
+    def test_rows_keys_links_and_table_headers(self):
+        # The template is an Excel table: crew headers are text ('1'), DAY is a formula, there is no ID column
         wb = load_workbook(self.path)
         ws = wb["By Day"]
-        self.assertTrue(str(ws["A2"].value).startswith("=IF("))
-        ws["A5"] = "TYPED-1"   # a typed ID still wins
-        ws["G2"], ws["G3"] = "HARROC", "helios"
-        wb["Lists"]["P2"] = "ORL"
+        self.assertEqual(ws["A1"].value, "DAY")
+        ws["F2"], ws["F3"] = "HARROC", "helios"
+        ws["H2"] = "Line one\nLine two"
+        ws["J3"] = "Floor plan\nhttps://x.sharepoint.com/sites/s/Shared%20Documents/Plan%20B.pdf"
         wb.save(self.path)
         df = se.parse_lv_byDay(str(self.path), "By Day", "ORL LOEWS")
-        self.assertEqual(list(df["EVENT_ID"][:5]), ["ORL-0001", "ORL-0002", "ORL-0003", "TYPED-1", "ORL-0005"])
+        self.assertEqual(df.loc[0, "EVENT_ID"], "2026-01-12 | 08:00 - 16:45 | NSRMCA | SET | HARROC | BALLROOMS A-G")
         self.assertEqual(list(df["FACILITY"][:3]), ["HARROC", "HELIOS", ""])
         self.assertTrue((df["CALENDAR"] == "ORL LOEWS").all())
         self.assertTrue((df["TIME_ZONE"] == "Eastern Standard Time").all())   # from the calendar
-        self.assertEqual(df.loc[2, "EXTRA_CREW"], 2)                          # row 4 has '+2'
-        self.assertTrue(df.loc[0, "LINK"].startswith("https://"))             # URL behind the cell, by row
+        self.assertEqual(df.loc[2, "EXTRA_CREW"], 2)                          # row 4 has '+2' under header '2'
+        self.assertEqual(df.loc[0, "NOTES"], "Line one\nLine two")
+        self.assertTrue(df.loc[0, "LINKS"][0][1].startswith("https://"))      # URL behind the cell, by row
+        # row 3 has a hyperlink behind the cell (labelled by the first line) plus a second URL on its own line
+        (label1, url1), second = df.loc[1, "LINKS"]
+        self.assertEqual(label1, "Floor plan")
+        self.assertTrue(url1.startswith("https://viadcorp.sharepoint.com/"))
+        self.assertEqual(second, ("Plan B.pdf", "https://x.sharepoint.com/sites/s/Shared%20Documents/Plan%20B.pdf"))
 
-    def test_inserted_blank_row_keeps_row_numbers(self):
+    def test_sorting_keeps_keys(self):
+        before = se.parse_lv_byDay(str(self.path), "By Day", "LV")
         wb = load_workbook(self.path)
-        wb["By Day"].insert_rows(3)   # empty row: its ID formula is missing too
+        ws = wb["By Day"]
+        rows = [[c.value for c in r] for r in ws.iter_rows(min_row=2, max_row=len(before) + 1)]
+        for i, vals in enumerate(reversed(rows), start=2):   # sort descending
+            for j, v in enumerate(vals, start=1):
+                if j > 1:                                     # DAY is a formula
+                    ws.cell(i, j).value = v
         wb.save(self.path)
-        df = se.parse_lv_byDay(str(self.path), "By Day", "LV")
-        self.assertEqual(list(df["EVENT_ID"][:3]), ["LV-0001", "LV-0003", "LV-0004"])  # Excel rows 2, 4, 5
+        after = se.parse_lv_byDay(str(self.path), "By Day", "LV")
+        self.assertEqual(sorted(before["EVENT_ID"]), sorted(after["EVENT_ID"]))
+
+
+class ShiftKeysAndLinks(unittest.TestCase):
+    def test_key_ignores_spacing_and_case(self):
+        k = se.shift_key(pd.Timestamp("2027-01-05"), "8:00-16:30", " Show  A ", "set", "harroc", "hall c")
+        self.assertEqual(k, "2027-01-05 | 08:00 - 16:30 | SHOW A | SET | HARROC | HALL C")
+        self.assertEqual(k, se.shift_key(pd.Timestamp("2027-01-05"), "08:00 - 16:30", "SHOW A", "SET", "HARROC", "Hall C"))
+
+    def test_links(self):
+        u1, u2 = "https://a.com/x/My%20File.xlsx?d=1", "https://b.com/y/"
+        self.assertEqual(se._links(f"{u1}\n{u2}", ""), [("My File.xlsx", u1), ("y", u2)])
+        self.assertEqual(se._links("Plan", u1), [("Plan", u1)])                 # hyperlink cell
+        self.assertEqual(se._links(f"Plan\n{u2}", u1), [("Plan", u1), ("y", u2)])
+        self.assertEqual(se._links("", u1), [("My File.xlsx", u1)])
+        self.assertEqual(se._links("see Erin", ""), [("see Erin", "")])
+        self.assertEqual(se._links("", ""), [])
 
 
 class Template(unittest.TestCase):
-    def test_dropdowns_row_colors_and_id_formula(self):
+    def test_table_dropdowns_row_colors_no_id(self):
         wb = load_workbook(TEMPLATE)
         ws = wb["By Day"]
-        self.assertEqual([c.value for c in ws[1]][6], "FACILITY")
-        lists = {str(d.sqref): d.formula1 for d in ws.data_validations.dataValidation}
-        self.assertIn("G2:G2000", lists)
+        hdr = [c.value for c in ws[1]]
+        self.assertNotIn("ID", hdr)
+        self.assertEqual(hdr[5], "FACILITY")
+        self.assertEqual(list(ws.tables), ["Shifts"])
+        self.assertIn("[DATE]", ws.tables["Shifts"].tableColumns[0].calculatedColumnFormula.attr_text)
         rules = {r.formula[0]: r.dxf.fill.end_color.rgb[-6:]
                  for rs in ws.conditional_formatting._cf_rules.values() for r in rs}
-        expected = {f'$G2="{c}"': f["excel_color"] for c, f in FACILITIES.items() if f["excel_color"]}
+        expected = {f'$F2="{c}"': f["excel_color"] for c, f in FACILITIES.items() if f["excel_color"]}
         self.assertEqual(rules, expected)
-        self.assertEqual(ws["A2000"].value, '=IF(C2000="","",Lists!$P$2&"-"&TEXT(ROW()-1,"0000"))')
-        self.assertEqual((wb["Lists"]["P1"].value, wb["Lists"]["P2"].value), ("ID PREFIX", "LV"))
+        self.assertIsNone(wb["Lists"]["P1"].value)
         text = " ".join(str(c.value or "") for c in wb["Instructions"]["A"])
-        self.assertIn("ID fills in automatically", text)
+        self.assertIn("A shift is identified by DATE + TIME + SHOW + FUNCTION + FACILITY + LOCATION", text)
+        self.assertIn("one per line", text)
         self.assertIn("The folder decides the Outlook calendar", text)
-        self.assertNotIn("BRANCH / STATE / TIME ZONE", text)
+        self.assertNotIn("ID PREFIX", text)
 
 
 class Sync(unittest.TestCase):
@@ -251,7 +290,7 @@ class Sync(unittest.TestCase):
         df = pd.DataFrame([_shift("LV-1", PAST), _shift("LV-2"), _shift("LV-3", se.today().strftime("%Y-%m-%d"))])
         stats, results, bad = se.sync_rows("t", df)
         self.assertEqual((stats["created"], stats["past"]), (2, 1))
-        self.assertEqual([r["ID"] for r in results], ["LV-2", "LV-3"])
+        self.assertEqual([r["Shift"] for r in results], ["LV-2", "LV-3"])
 
     def test_update_skip_and_duplicates(self):
         df = pd.DataFrame([_shift("LV-1"), _shift("LV-2"), _shift("LV-3")])
@@ -259,7 +298,7 @@ class Sync(unittest.TestCase):
                                    "LV-2": {"graph_id": "g2", "hash": "old"}}}
         stats, _, bad = se.sync_rows("t", df, {"LV-3"})
         self.assertEqual((stats["skipped"], stats["updated"], stats["created"]), (1, 1, 0))
-        self.assertEqual(bad, [("LV-3", "ID LV-3 is used by more than one row")])
+        self.assertEqual([k for k, _ in bad], ["LV-3"])
 
     def test_payload_colors_and_time_zone(self):
         df = pd.DataFrame([_shift("ORL-1", calendar="ORL LOEWS", facility="HARROC"),
@@ -272,15 +311,34 @@ class Sync(unittest.TestCase):
         self.assertIn([], cats)
         self.assertTrue(all(p["start"]["timeZone"] == "Pacific Standard Time" for p in payloads.values()))
 
-    def test_hash_unchanged_for_uncolored_rows(self):
-        r = _shift("LV-1", function="PREP")
-        old = hashlib.md5("|".join(str(r.get(f, "")) for f in
-                                   ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8]
-        self.assertEqual(se._field_hash(r), old)       # no needless Outlook updates
-        colored = _shift("LV-1")                       # SET on LV: colored, so its hash includes the color
-        plain = hashlib.md5("|".join(str(colored.get(f, "")) for f in
-                                     ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"]).encode()).hexdigest()[:8]
-        self.assertNotEqual(se._field_hash(colored), plain)
+    def test_subject_notes_and_hidden_tracking(self):
+        r = {**_shift("K1", calendar="ORL LOEWS", facility="HARROC"), "SHOW": "Show A", "FOREMAN": "Bob",
+             "NOTES": "Line 1\nLine 2", "LINKS": [("Plan", "https://x.com/p?a=1&b=2"), ("call Erin", "")]}
+        se.sync_rows("t", pd.DataFrame([r, _shift("K2", function="STRIKE")]))
+        (_, _, p1), (_, _, p2) = sorted(self.calls, key=lambda c: c[1])   # loews@ first
+        self.assertEqual(p1["subject"], "HARROC - Show A - SET")
+        self.assertEqual(p2["subject"], "S - STRIKE")                    # no facility
+        body = p1["body"]["content"]
+        self.assertEqual(body, 'Foreman: Bob. Line 1<br>Line 2<br>SharePoint: <a href="https://x.com/p?a=1&amp;b=2">Plan'
+                               '</a><br>SharePoint: call Erin')
+        self.assertNotIn("K1", body)                                     # nothing of the key in the notes
+        props = {x["id"]: x["value"] for x in p1["singleValueExtendedProperties"]}
+        self.assertEqual(props[se.KEY_PROP], "K1")
+        self.assertEqual(props[se.HASH_PROP], se._field_hash(pd.Series(r)))
+
+    def test_tracking_from_properties_or_legacy_body(self):
+        new = {"singleValueExtendedProperties": [{"id": se.KEY_PROP.replace("GES_KEY", "ges_key"), "value": "K"},
+                                                 {"id": se.HASH_PROP, "value": "h"}]}
+        self.assertEqual(se._tracking(new), ("K", "h"))
+        self.assertEqual(se._tracking({"body": {"content": "GES_ID:LV-0001|GES_HASH:abc\nnotes"}}), ("legacy:LV-0001", ""))
+        self.assertEqual(se._tracking({"body": {"content": "typed by hand"}}), ("", ""))
+
+    def test_old_events_are_replaced(self):
+        self.cal = {"test@x.com": {"legacy:LV-0001": {"graph_id": "g1", "hash": ""}}}
+        stats, _, _ = se.sync_rows("t", pd.DataFrame([_shift("K1")]))
+        self.assertEqual(stats["created"], 1)
+        se._delete_removed("t", {"K1": "test@x.com"}, {"test@x.com"})
+        self.assertEqual(self.deleted, [("test@x.com", "g1")])
 
     def files(self):
         return {"Las Vegas/a.xlsx": pd.DataFrame([_shift("LV-1"), _shift("LV-OLD", PAST)]),
@@ -359,7 +417,8 @@ class OutlookView(unittest.TestCase):
         self.assertIn('outlook.timezone="Pacific Standard Time"', calls[0][1]["Prefer"])
         self.assertIsNone(calls[1][2])  # the next page link already has the query
         a, b = events
-        self.assertEqual((a["EVENT_ID"], a["NOTES"], a["LOCATION"]), ("LV-0001", "Foreman: Bob. Bring lifts", "Hall C"))
+        self.assertEqual((a["EVENT_ID"], a["NOTES"], a["LOCATION"]),
+                         ("legacy:LV-0001", "Foreman: Bob. Bring lifts", "Hall C"))
         self.assertEqual(a["START"], pd.Timestamp("2027-01-05 07:00"))
         self.assertEqual(str(a["MODIFIED"].tz), "UTC")
         self.assertEqual((b["EVENT_ID"], b["NOTES"], b["MODIFIED"]), ("", "typed in Outlook", None))
@@ -377,6 +436,15 @@ class OutlookView(unittest.TestCase):
             se.requests = orig
         self.assertGreater(calls[0]["endDateTime"], "2027-01-20T01:00:00Z")
 
+    def test_calendar_map_raises_when_outlook_cannot_be_read(self):
+        orig = se.requests
+        se.requests = types.SimpleNamespace(get=lambda *a, **k: types.SimpleNamespace(status_code=500))
+        try:
+            with self.assertRaises(RuntimeError):
+                se.build_calendar_map("t", "orl@x.com", pd.Timestamp("2027-01-05"), pd.Timestamp("2027-01-19"))
+        finally:
+            se.requests = orig
+
     def test_error_is_reported(self):
         (events, err), _ = self.read([{"status": 403}])
         self.assertEqual(events, [])
@@ -388,6 +456,43 @@ class OutlookView(unittest.TestCase):
         self.assertEqual([e["SUBJECT"] for e in day5], ["Show B - STRIKE", "Show A - SET"])  # all-day first
         self.assertEqual([e["SUBJECT"] for e in se.events_on_day(events, "2027-01-06")], ["Show B - STRIKE"])
         self.assertEqual(se.events_on_day(events, "2027-01-07"), [])  # all-day end is exclusive
+
+
+class AdminAlerts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.orig = (se.ALERTS_SENT_FILE, se.requests)
+        se.ALERTS_SENT_FILE = self.tmp / "sent.json"
+        self.sent, self.status = [], 202
+
+        def post(url, headers=None, json=None, timeout=None):
+            self.sent.append((url, json))
+            return types.SimpleNamespace(status_code=self.status)
+        se.requests = types.SimpleNamespace(post=post)
+
+    def tearDown(self):
+        se.ALERTS_SENT_FILE, se.requests = self.orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_only_new_problems_are_emailed(self):
+        self.assertIn("Emailed 2", se.alert_admins("t", ["a", "b"]))
+        url, body = self.sent[0]
+        self.assertIn("/users/test@x.com/sendMail", url)
+        self.assertEqual([r["emailAddress"]["address"] for r in body["message"]["toRecipients"]],
+                         ["admin1@x.com", "admin2@x.com"])
+        self.assertEqual(se.alert_admins("t", ["a", "b"]), "")         # same problems: no email
+        self.assertIn("Emailed 1", se.alert_admins("t", ["b", "c"]))   # only c is new
+        html = self.sent[-1][1]["message"]["body"]["content"]
+        self.assertIn("<li>c</li>", html)
+        self.assertNotIn("<li>b</li>", html)
+        se.alert_admins("t", [])                                        # all fixed
+        self.assertIn("Emailed 1", se.alert_admins("t", ["a"]))         # a came back: emailed again
+
+    def test_failed_email_is_retried(self):
+        self.status = 403
+        self.assertIn("Mail.Send", se.alert_admins("t", ["a"]))
+        self.status = 202
+        self.assertIn("Emailed 1", se.alert_admins("t", ["a"]))
 
 
 class Overtime(unittest.TestCase):

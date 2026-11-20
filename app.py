@@ -379,14 +379,15 @@ elif "Schedule" in page:
             st.info("Pushing to: " + "; ".join(f"**{', '.join(sorted(ks))}** → {m}" for m, ks in dest.items()))
         if not ok_s.all():
             st.error(f"**{int((~ok_s).sum())}** row(s) will NOT be pushed until fixed:")
-            bad = df_fut.loc[~ok_s, ["EVENT_ID", "DATE", "SHOW", "FILE"]].assign(Problem=err_s[~ok_s])
+            bad = df_fut.loc[~ok_s, ["DATE", "TIME", "SHOW", "FUNCTION", "FACILITY", "LOCATION", "FILE"]].assign(
+                Problem=err_s[~ok_s])
             bad["DATE"] = bad["DATE"].dt.strftime("%Y-%m-%d")
             st.dataframe(bad, hide_index=True, use_container_width=True)
         fac_w = facility_warnings(df_fut)
         if (fac_w != "").any():
             st.warning(f"**{int((fac_w != '').sum())}** row(s) have a FACILITY note. They are still pushed to "
                        f"their folder's calendar, without a facility color:")
-            w = df_fut.loc[fac_w != "", ["EVENT_ID", "DATE", "SHOW", "FACILITY", "FILE"]].assign(Note=fac_w[fac_w != ""])
+            w = df_fut.loc[fac_w != "", ["DATE", "SHOW", "FUNCTION", "FACILITY", "FILE"]].assign(Note=fac_w[fac_w != ""])
             w["DATE"] = w["DATE"].dt.strftime("%Y-%m-%d")
             st.dataframe(w, hide_index=True, use_container_width=True)
 
@@ -427,11 +428,11 @@ elif "Schedule" in page:
                     if (cat_err := ensure_outlook_categories(token, m)):
                         st.warning(f"Event colors: {cat_err}")
                 stats, results, not_pushed = sync_rows(token, df_fut.head(int(test_n)), dups)
-                results += [{"ID": e, "Show": "—", "Status": f"Not pushed: {m}"} for e, m in not_pushed]
+                results += [{"Shift": e, "Show": "—", "Status": f"Not pushed: {m}"} for e, m in not_pushed]
                 # Remove shifts deleted from Excel (today on, every calendar), from a fresh read of SharePoint
                 _, parsed_now, errors_now, _ = load_all(token)
                 removed, problem = remove_deleted_shifts(token, parsed_now, errors_now)
-                results += [{"ID": e, "Show": "—", "Status": "Deleted (removed from Excel)" if ok else "Delete failed"}
+                results += [{"Shift": e, "Show": "—", "Status": "Deleted (removed from Excel)" if ok else "Delete failed"}
                             for e, _, ok in removed]
             if problem:
                 st.error(problem)
@@ -550,7 +551,7 @@ elif page == "Outlook Calendar":
         with st.expander(f"{_when(e)} · {e['SUBJECT']}", expanded=len(day_events) <= 3):
             st.markdown(f"**When:** {span}  \n**Location:** {e['LOCATION'] or '—'}  \n"
                         f"**Color category:** {', '.join(e['CATEGORIES']) or '—'}  \n"
-                        f"**Schedule ID:** {e['EVENT_ID'] or '— (not created by the app)'}  \n"
+                        f"**From the schedule:** {'Yes' if e['EVENT_ID'] else 'No (added in Outlook)'}  \n"
                         f"**Last changed in Outlook:** "
                         + (e["MODIFIED"].tz_convert("America/Los_Angeles").strftime("%b %d, %Y %I:%M %p") + " PT"
                            if e["MODIFIED"] is not None else "—"))

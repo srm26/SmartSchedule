@@ -7,8 +7,11 @@ when the App Service starts, so auto-sync no longer waits for someone to open th
 - One SharePoint folder per calendar (admin workbook, Calendars sheet). Every row in a file goes to its
   folder's calendar; FACILITY only picks colors (and warns when a facility belongs to another calendar).
 - Rows dated before today are never created or updated. Past events in Outlook are kept as history.
-- Duplicate IDs (in one file or across files) are held back with a message.
+- A shift is identified by DATE + TIME + SHOW + FUNCTION + FACILITY + LOCATION (no ID column), so sorting,
+  filtering or inserting rows changes nothing in Outlook. Changing one of those fields replaces the event.
+  Rows with the same key (in one file or across files) are held back with a message.
 - Shifts removed from Excel are deleted from Outlook (today to +18 months), unless a file can't be read.
+- New problems found by auto-sync are emailed to the admins on the admin workbook's Alerts sheet.
 """
 import io
 import json
@@ -21,6 +24,7 @@ import tomllib
 from datetime import timedelta, datetime as dt
 from html import escape
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import msal
@@ -34,8 +38,6 @@ from schedule_config import CALENDARS, FACILITIES, CONFIG_WARNINGS, outlook_cate
 _PT = ZoneInfo("America/Los_Angeles")
 LV_SHEET      = "By Day"
 LV_CREW_COLS  = [1, 2, 3, 4, 5, 6, 7]   # numeric header columns for crew slots
-LISTS_SHEET   = "Lists"                  # holds the file's ID PREFIX
-ID_PREFIX_COL = "ID PREFIX"              # Lists column: prefix used by the ID formula (e.g. LV -> LV-0001)
 DEFAULT_TZ    = "Pacific Standard Time"
 LINK_COL      = "SHAREPOINT LINK"        # optional By Day column; shown on the Outlook event notes
 FACILITY_COL  = "FACILITY"
@@ -52,26 +54,56 @@ DATA_DIR = Path("/home/data") if os.environ.get("WEBSITE_SITE_NAME") else ROOT /
 SWEEP_STATE_FILE  = DATA_DIR / "sweep_state.json"    # last synced version of each file
 SWEEP_STATUS_FILE = DATA_DIR / "sweep_status.json"   # last check / log, shown in the app sidebar
 SWEEP_CONFIG_FILE = DATA_DIR / "sweep_config.json"   # sweep test mode, set from the app sidebar
+ALERTS_SENT_FILE  = DATA_DIR / "alerts_sent.json"    # problems already emailed to the admins
+SYNC_FORMAT = 2   # bump when the way events are stored changes: every file is then synced again
 
 
 def today():
     return pd.Timestamp(dt.now(_PT).date())
 
 
-# ─── OUTLOOK BODY MARKERS ────────────────────────────────────────────
-# EVENT_ID and field hash are stored in the first line of the event body. Outlook is the source of truth.
+# ─── OUTLOOK TRACKING ────────────────────────────────────────────────
+# Each app event carries the shift key and a hash of its fields in two hidden Outlook properties (not shown
+# in the event). Outlook is the source of truth. Older events kept 'GES_ID:..|GES_HASH:..' in the first body
+# line; those are read as 'legacy:<id>' so the new events replace them.
+_PROP_SET = "String {6f1c2a7e-9b3d-4c58-a1e4-3d7b9c0e5f21} Name "
+KEY_PROP, HASH_PROP = _PROP_SET + "GES_KEY", _PROP_SET + "GES_HASH"
+_EXPAND = f"singleValueExtendedProperties($filter=id eq '{KEY_PROP}' or id eq '{HASH_PROP}')"
+
+
+def _norm(v):
+    return " ".join(str(v or "").split()).upper()
+
+
+def shift_key(date, time, show, function, facility, location):
+    """The shift's identity: DATE | TIME | SHOW | FUNCTION | FACILITY | LOCATION (spacing and case ignored)."""
+    t_start, t_end = _parse_time_range(time)
+    t = f"{t_start} - {t_end}" if t_start else _norm(time)
+    return " | ".join([date.strftime("%Y-%m-%d"), t, _norm(show), _norm(function), _norm(facility), _norm(location)])
+
+
 def _event_categories(row):
     cat = event_category(row.get("CALENDAR"), row.get("FUNCTION"), row.get("FACILITY"))
     return [cat] if cat else []
 
 
+def _event_subject(row):
+    return " - ".join(p for p in (row.get("FACILITY"), row["SHOW"], row["FUNCTION"]) if p)
+
+
 def _field_hash(row):
-    key = "|".join(str(row.get(f, "")) for f in ["DATE", "SHOW", "FUNCTION", "TIME", "LOCATION", "FOREMAN", "NOTES"])
-    if row.get("LINK"):  # only when present, so rows without a link keep their existing hash
-        key += "|" + str(row["LINK"])
-    if _event_categories(row):  # same idea: only colored rows get a new hash
-        key += "|cat:" + ",".join(_event_categories(row))
+    key = "|".join([_event_subject(row), _event_notes(row), ",".join(_event_categories(row))]
+                   + [str(row.get(f, "")) for f in ["DATE", "TIME", "LOCATION"]])
     return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def _tracking(e):
+    """(key, hash) of an Outlook event: from the hidden properties, else the legacy body line, else ('', '')."""
+    props = {p["id"].rsplit(" ", 1)[-1].upper(): p.get("value", "") for p in e.get("singleValueExtendedProperties") or []}
+    if props.get("GES_KEY"):
+        return props["GES_KEY"], props.get("GES_HASH", "")
+    eid, _ = _parse_body((e.get("body") or {}).get("content", ""))
+    return (f"legacy:{eid}", "") if eid else ("", "")
 
 
 _PRESET_NAMES = {v: k for k, v in schedule_config.COLORS.items() if k != "grey"}
@@ -102,24 +134,22 @@ def ensure_outlook_categories(token, mailbox):
 
 
 def _event_notes(row):
-    """Outlook notes text: foreman, the NOTES column, and the SharePoint link on its own line."""
+    """Outlook notes text: foreman, the NOTES column (all its lines), and each SharePoint link on its own line."""
     notes = f"Foreman: {row['FOREMAN']}. {row['NOTES']}".strip()
-    if row.get("LINK"):
-        label = row.get("LINK_TEXT") or row["LINK"]
-        notes += f"\nSharePoint: [{label}]({row['LINK']})"  # turned into a clickable link by _make_body
+    for label, url in row.get("LINKS") or []:
+        notes += f"\nSharePoint: [{label}]({url})" if url else f"\nSharePoint: {label}"  # link made by _make_body
     return notes
 
 
-def _make_body(notes, event_id, field_hash):
-    """HTML event body: marker line, then the notes; '[label](url)' becomes a clickable link."""
-    marker = f"GES_ID:{event_id}|GES_HASH:{field_hash}"
-    html = escape(f"{marker}\n{notes}".strip() if notes else marker)
+def _make_body(notes):
+    """HTML event body from the notes; '[label](url)' becomes a clickable link."""
+    html = escape(notes.strip())
     html = re.sub(r"\[([^\]\n]+)\]\((\S+?)\)", r'<a href="\2">\1</a>', html)
     return html.replace("\n", "<br>")
 
 
 def _parse_body(body_content):
-    """Extract (event_id, field_hash) from event body, or ('', '') if not present."""
+    """Legacy events: (event_id, field_hash) from the 'GES_ID:..|GES_HASH:..' body line, or ('', '')."""
     for line in (body_content or "").splitlines():
         line = line.strip()
         if line.startswith("GES_ID:") and "|GES_HASH:" in line:
@@ -129,13 +159,15 @@ def _parse_body(body_content):
 
 
 def build_calendar_map(token, mailbox, start_date, end_date):
-    """Query Outlook for the date range and return {EVENT_ID: {graph_id, hash}}."""
+    """Query Outlook for the date range and return {shift key: {graph_id, hash}} for the app's events.
+    Raises if Outlook can't be read: a partial map would make the app create duplicates or skip deletes."""
     url    = f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
     params = {
         "startDateTime": start_date.strftime("%Y-%m-%dT00:00:00Z"),
         # +2 days: an evening shift on the last day starts after midnight UTC (US time zones are behind UTC)
         "endDateTime":   (end_date + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z"),
         "$select": "id,body",
+        "$expand": _EXPAND,
         "$top": "500",
     }
     headers = {"Authorization": f"Bearer {token}", "Prefer": "outlook.body-content-type='text'"}
@@ -143,10 +175,10 @@ def build_calendar_map(token, mailbox, start_date, end_date):
     while next_url:
         resp = requests.get(next_url, headers=headers, params=next_params, timeout=15)
         if resp.status_code != 200:
-            break
+            raise RuntimeError(f"could not read the Outlook calendar of {mailbox} ({resp.status_code})")
         data = resp.json()
         for e in data.get("value", []):
-            eid, fhash = _parse_body(e.get("body", {}).get("content", ""))
+            eid, fhash = _tracking(e)
             if eid:
                 mapping[eid] = {"graph_id": e["id"], "hash": fhash}
         next_url, next_params = data.get("@odata.nextLink"), None
@@ -156,11 +188,13 @@ def build_calendar_map(token, mailbox, start_date, end_date):
 def read_calendar_events(token, mailbox, start_date, end_date, time_zone):
     """Read-only: every Outlook event from start_date through end_date, times in `time_zone`.
     Returns (events, error). Each event: SUBJECT, START, END (end is exclusive), ALL_DAY, LOCATION,
-    CATEGORIES, EVENT_ID (app ID or ''), NOTES (body text without the app's ID line), MODIFIED (UTC)."""
+    CATEGORIES, EVENT_ID (shift key if the app made it, else ''), NOTES (body text without a legacy ID line),
+    MODIFIED (UTC)."""
     params = {
         "startDateTime": (start_date - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"),  # pad for time zones
         "endDateTime":   (end_date + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z"),
         "$select": "subject,start,end,isAllDay,location,categories,body,lastModifiedDateTime",
+        "$expand": _EXPAND,
         "$orderby": "start/dateTime",
         "$top": "500",
     }
@@ -174,7 +208,7 @@ def read_calendar_events(token, mailbox, start_date, end_date, time_zone):
         data = resp.json()
         for e in data.get("value", []):
             body = (e.get("body") or {}).get("content", "")
-            eid, _ = _parse_body(body)
+            eid, _ = _tracking(e)
             events.append({
                 "SUBJECT":    e.get("subject") or "(no title)",
                 "START":      pd.Timestamp(e["start"]["dateTime"][:19]),
@@ -227,11 +261,6 @@ def get_graph_token():
     raise RuntimeError(result.get("error_description", "Graph auth failed"))
 
 
-def _make_event_id(show, function, date):
-    slug = re.sub(r"[^A-Za-z0-9]", "", str(show))[:20].upper()
-    return f"{slug}-{function}-{date.strftime('%Y%m%d')}"
-
-
 def _parse_time_range(time_str):
     """Parse '8:00 - 16:30' into ('08:00', '16:30'), or return (None, None)."""
     if not time_str:
@@ -261,10 +290,12 @@ def _event_payload(row, event_id, field_hash):
     end_dt   = pd.Timestamp(row["END_DATE"] if pd.notna(row["END_DATE"]) else row["DATE"])
     t_start, t_end = _parse_time_range(row["TIME"])
     tz = row.get("TIME_ZONE") or DEFAULT_TZ
-    payload = {"subject": f"{row['SHOW']} - {row['FUNCTION']}",
+    payload = {"subject": _event_subject(row),
                "location": {"displayName": row["LOCATION"] or "Not specified"},
-               "body": {"contentType": "HTML", "content": _make_body(_event_notes(row), event_id, field_hash)},
-               "categories": _event_categories(row)}
+               "body": {"contentType": "HTML", "content": _make_body(_event_notes(row))},
+               "categories": _event_categories(row),
+               "singleValueExtendedProperties": [{"id": KEY_PROP, "value": event_id},
+                                                 {"id": HASH_PROP, "value": field_hash}]}
     if t_start and t_end:
         payload.update(isAllDay=False,
                        start={"dateTime": start_dt.strftime(f"%Y-%m-%dT{t_start}:00"), "timeZone": tz},
@@ -357,16 +388,30 @@ def _cell_text(val):
     return "" if s.lower() in ("nan", "none") else s
 
 
-def _read_id_prefix(xl):
-    """The file's ID PREFIX (Lists sheet), used by the ID formula; '' if absent."""
-    if LISTS_SHEET not in xl.sheet_names:
-        return ""
-    lists = xl.parse(LISTS_SHEET, header=0, dtype=str)
-    lists.columns = [str(c).strip().upper() for c in lists.columns]
-    if ID_PREFIX_COL not in lists.columns:
-        return ""
-    vals = [_cell_text(v) for v in lists[ID_PREFIX_COL]]
-    return next((v for v in vals if v), "")
+def _is_url(s):
+    return bool(re.match(r"https?://\S+$", s, re.I))
+
+
+def _url_label(url):
+    """A short name for a link: the file or page name at the end of the URL."""
+    name = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
+    return name or url
+
+
+def _links(text, url):
+    """[(label, url)] for a SHAREPOINT LINK cell: the hyperlink behind the cell (labelled by the cell's first
+    line that isn't a URL), then each URL on its own line. Other text lines are kept as (text, '')."""
+    lines = [l.strip() for l in str(text).splitlines() if l.strip()]
+    out = []
+    if url:
+        label = next((l for l in lines if not _is_url(l)), "") or _url_label(url)
+        out.append((label, url))
+        if label in lines:
+            lines.remove(label)
+    for l in lines:
+        if l != url:
+            out.append((_url_label(l), l) if _is_url(l) else (l, ""))
+    return out
 
 
 def _read_link_urls(src, sheet_name):
@@ -386,16 +431,16 @@ def _read_link_urls(src, sheet_name):
 def parse_lv_byDay(src, sheet_name, calendar):
     """Parse the 'By Day' sheet of the GES Electrical Show Schedule template; every row goes to `calendar`.
 
-    Columns: ID, DAY, DATE, TIME, SHOW, FUNCTION, FACILITY, LOCATION, NOTES, FOREMAN, SHAREPOINT LINK, 1..7.
-    Crew columns 1-7 hold names or '+N' (extra unnamed crew).
-    ID is a formula: <ID PREFIX>-<row number - 1>. When the cell has no saved value (a file saved by a script),
-    the same ID is worked out here, so the ID never depends on how the file was saved.
+    Columns: DAY, DATE, TIME, SHOW, FUNCTION, FACILITY, LOCATION, NOTES, FOREMAN, SHAREPOINT LINK, 1..7.
+    Crew columns 1-7 hold names or '+N' (extra unnamed crew). An old ID column is ignored.
+    Each row's EVENT_ID is its shift key (see shift_key).
     """
     xl = pd.ExcelFile(src)
-    # Read crew columns as text, otherwise a column holding only '+1' comes back as 1.0
-    raw = xl.parse(sheet_name, header=0, dtype={c: str for c in LV_CREW_COLS})
+    # Read crew columns as text, otherwise a column holding only '+1' comes back as 1.0.
+    # In an Excel Table the crew headers are text ('1'), elsewhere numbers (1).
+    raw = xl.parse(sheet_name, header=0, dtype={c: str for c in LV_CREW_COLS + [str(c) for c in LV_CREW_COLS]})
+    raw.columns = [int(c) if str(c).strip().isdigit() else c for c in raw.columns]
     link_urls = _read_link_urls(src, sheet_name) if LINK_COL in raw.columns else {}
-    prefix = _read_id_prefix(xl)
     time_zone = (CALENDARS.get(calendar) or {}).get("time_zone") or DEFAULT_TZ
 
     required = {"DATE", "SHOW", "FUNCTION", "LOCATION", "NOTES", "FOREMAN"}
@@ -428,30 +473,25 @@ def parse_lv_byDay(src, sheet_name, calendar):
                 crew_list.append(val)
 
         fn = _cell_text(r.get("FUNCTION")).upper() or "SHOW"
-        id_val = r.get("ID", "")
-        if isinstance(id_val, float) and id_val.is_integer():
-            id_val = int(id_val)  # Excel numbers come in as 1.0 — store as "1"
-        raw_id = _cell_text(id_val)
-        if not raw_id and prefix:
-            raw_id = f"{prefix}-{i + 1:04d}"  # same as the ID formula: row number - 1 (row i + 2 in Excel)
+        time, location = _cell_text(r.get("TIME")), _cell_text(r.get("LOCATION"))
+        facility = _cell_text(r.get(FACILITY_COL)).upper()
         rows.append({
-            "EVENT_ID":      raw_id or _make_event_id(show, fn, date),
+            "EVENT_ID":      shift_key(date, time, show, fn, facility, location),
             "DATE":          date,
             "END_DATE":      pd.NaT,
             "SHOW":          show,
             "FUNCTION":      fn,
-            "LOCATION":      _cell_text(r.get("LOCATION")),
-            "TIME":          _cell_text(r.get("TIME")),
+            "LOCATION":      location,
+            "TIME":          time,
             "FOREMAN":       foreman,
             "NOTES":         _cell_text(r.get("NOTES")),
             "TOTAL_CREW":    max(len(crew_list) + extra, 1),
             "CREW_LIST":     crew_list,
             "SCHEDULE_TYPE": "shifts",
             "TIME_ZONE":     time_zone,
-            # LINK = the URL (from the hyperlink behind the cell if there is one); LINK_TEXT = what the cell shows
-            "LINK":          link_urls.get(i + 2) or _cell_text(r.get(LINK_COL)),
-            "LINK_TEXT":     _cell_text(r.get(LINK_COL)),
-            "FACILITY":      _cell_text(r.get(FACILITY_COL)).upper(),
+            # [(label, url)]: the hyperlink behind the cell (matched by Excel row) and URLs typed one per line
+            "LINKS":         _links(_cell_text(r.get(LINK_COL)), link_urls.get(i + 2, "")),
+            "FACILITY":      facility,
             "CALENDAR":      calendar,
             "EXTRA_CREW":    extra,  # unnamed '+N' crew, used by the Overtime page
         })
@@ -480,7 +520,7 @@ def load_all(token):
 
 # ─── ROUTING ─────────────────────────────────────────────────────────
 def duplicate_ids(dfs):
-    """IDs used by more than one row (in one file or across files)."""
+    """Shift keys used by more than one row (in one file or across files)."""
     ids = pd.concat([d["EVENT_ID"] for d in dfs]) if dfs else pd.Series(dtype=object)
     return set(ids[ids.duplicated()])
 
@@ -489,7 +529,8 @@ def route_rows(df, dup_ids=()):
     """(mailbox, error) per row: the row's calendar mailbox, or None with the reason it is not pushed."""
     def route(r):
         if r["EVENT_ID"] in dup_ids:
-            return None, f"ID {r['EVENT_ID']} is used by more than one row"
+            return None, ("another row has the same DATE, TIME, SHOW, FUNCTION, FACILITY and LOCATION; "
+                          "remove the extra row or make them differ")
         c = CALENDARS.get(r["CALENDAR"])
         if not c:
             return None, f"calendar {r['CALENDAR']} is not on the admin Calendars sheet"
@@ -606,7 +647,7 @@ def sync_rows(token, df, dup_ids=()):
             except Exception as e:
                 stats["failed"] += 1
                 status = f"Error: {e}"
-            results.append({"ID": eid, "Show": row["SHOW"], "Status": status})
+            results.append({"Shift": eid, "Show": row["SHOW"], "Status": status})
     return stats, results, not_pushed
 
 
@@ -637,50 +678,97 @@ def set_sweep_test_rows(n):
     _write_json(SWEEP_CONFIG_FILE, {"test_rows": int(n)})
 
 
+def send_admin_email(token, problems):
+    """Email problems to the admins on the admin Alerts sheet. Returns '' or why it was not sent."""
+    alerts = schedule_config.ALERTS
+    if not alerts["to"] or not alerts["sender"]:
+        return "the admin workbook's Alerts sheet needs an ADMIN EMAIL and a SEND FROM mailbox"
+    items = "".join(f"<li>{escape(p)}</li>" for p in problems)
+    html = (f"<p>SmartSchedule auto-sync found {len(problems)} new problem(s):</p><ul>{items}</ul>"
+            f"<p>Fix them in the Excel file or the admin workbook. Auto-sync tries again every {SYNC_MINUTES} "
+            f"minutes. You get one email per new problem; it is not repeated while the problem stays.</p>")
+    msg = {"subject": f"SmartSchedule: {len(problems)} new problem(s)", "body": {"contentType": "HTML", "content": html},
+           "toRecipients": [{"emailAddress": {"address": a}} for a in alerts["to"]]}
+    try:
+        r = requests.post(f"https://graph.microsoft.com/v1.0/users/{alerts['sender']}/sendMail",
+                          headers={"Authorization": f"Bearer {token}"},
+                          json={"message": msg, "saveToSentItems": False}, timeout=15)
+    except Exception as e:
+        return str(e)
+    if r.status_code == 202:
+        return ""
+    return f"Outlook said {r.status_code}" + (" - the app needs the Mail.Send permission" if r.status_code == 403 else "")
+
+
+def alert_admins(token, problems):
+    """Email the problems not emailed before. Fixed problems are forgotten, so they are emailed again if they
+    come back. Returns a log line ('' when there is nothing new)."""
+    current = sorted(set(problems))
+    new = [p for p in current if p not in set(_read_json(ALERTS_SENT_FILE, []))]
+    if new and (err := send_admin_email(token, new)):
+        return f"⚠️ Admin email not sent: {err}"   # not marked as sent, so it is tried again next sweep
+    _write_json(ALERTS_SENT_FILE, current)
+    return f"📧 Emailed {len(new)} new problem(s) to the admins" if new else ""
+
+
 def run_sweep():
-    """One auto-sync: push changed files, then remove deleted shifts. Writes the result to SWEEP_STATUS_FILE."""
+    """One auto-sync: push changed files, remove deleted shifts, email new problems to the admins.
+    Writes the result to SWEEP_STATUS_FILE."""
     status = {**sweep_status(), "running": True, "error": None}
     _write_json(SWEEP_STATUS_FILE, status)
-    log = []
+    log, problems, token = [], [], None
     try:
         token = get_graph_token()
         files, parsed, errors, admin_modified = load_all(token)
         state = _read_json(SWEEP_STATE_FILE, {})
-        if state.get("_admin_modified") != admin_modified:
-            state = {"_admin_modified": admin_modified}  # settings changed: re-check every file
+        if state.get("_admin_modified") != admin_modified or state.get("_format") != SYNC_FORMAT:
+            # settings changed, or a new app version stores events differently: re-check every file
+            state = {"_admin_modified": admin_modified, "_format": SYNC_FORMAT}
         limit = sweep_test_rows()
         dups  = duplicate_ids(list(parsed.values()))
         log += [f"⚠️ {w}" for w in CONFIG_WARNINGS]
+        problems += [f"Admin workbook: {w}" for w in CONFIG_WARNINGS]
         for m in sorted(_all_calendar_mailboxes()):
             if (cat_err := ensure_outlook_categories(token, m)):
                 log.append(f"⚠️ Event colors: {cat_err}")
+                problems.append(f"Event colors: {cat_err}")
+        for path, df_p in parsed.items():
+            fut = df_p[df_p["DATE"] >= today()]
+            notes = facility_warnings(fut)
+            problems += [f"{path}: {k} - {n} (still pushed)" for k, n in zip(fut["EVENT_ID"], notes) if n]
         for f in files:
             path, last_mod = f["path"], f["modified"]
             if path in errors:
                 log.append(f"❌ {path} — Error: {errors[path]}")
+                problems.append(f"{path}: could not be read - {errors[path]}")
                 continue
             if path not in parsed or state.get(path, {}).get("last_modified") == last_mod:
                 continue  # not a schedule file, or unchanged
             df_f = parsed[path]
             if limit > 0:
                 df_f = df_f[df_f["DATE"] >= today()].head(limit)
-            stats, _, bad = sync_rows(token, df_f, dups)
+            stats, results, bad = sync_rows(token, df_f, dups)
             result = (f"Created:{stats['created']} Updated:{stats['updated']} Skipped:{stats['skipped']} "
                       f"Failed:{stats['failed']} Past (not pushed):{stats['past']}")
             if bad:
                 result += f" Not pushed:{len(bad)} ({'; '.join(f'{e}: {m}' for e, m in bad[:3])}{'; ...' if len(bad) > 3 else ''})"
-            # Files with rows not pushed are retried next sweep (e.g. once the duplicate ID is fixed)
+            problems += [f"{path}: {k} - not pushed: {m}" for k, m in bad]
+            problems += [f"{path}: {r['Shift']} - {r['Status']}" for r in results
+                         if r["Status"] not in ("Created", "Updated")]
+            # Files with rows not pushed are retried next sweep (e.g. once the duplicate row is fixed)
             state[path] = {"last_modified": None if bad or stats["failed"] else last_mod,
                            "last_synced": dt.now(_PT).strftime("%Y-%m-%d %H:%M PT"), "result": result}
             log.append(f"✅ {path} — {result}")
         for folder, err in errors.items():
             if folder not in {f["path"] for f in files}:
                 log.append(f"❌ {folder} — {err}")
+                problems.append(f"{folder}: {err}")
         _write_json(SWEEP_STATE_FILE, state)
 
         removed, problem = remove_deleted_shifts(token, parsed, errors)
         if problem:
             status["error"] = problem
+            problems.append(problem)
         ok_ids  = [e for e, _, ok in removed if ok]
         bad_ids = [e for e, _, ok in removed if not ok]
         if ok_ids:
@@ -688,10 +776,18 @@ def run_sweep():
                        f"{', '.join(ok_ids[:10])}{' ...' if len(ok_ids) > 10 else ''}")
         if bad_ids:
             status["error"] = f"Could not delete {len(bad_ids)} removed event(s): {', '.join(bad_ids[:10])}"
+            problems += [f"Could not delete the Outlook event of removed shift {e} ({m})" for e, m, ok in removed if not ok]
     except Exception as e:
         status["error"] = str(e)
         log.append(f"❌ Sweep error: {e}")
+        problems.append(f"Auto-sync stopped with an error: {e}")
     finally:
+        if token:
+            try:
+                if (line := alert_admins(token, problems)):
+                    log.append(line)
+            except Exception as e:
+                log.append(f"⚠️ Admin email not sent: {e}")
         status.update(last_check=dt.now(_PT).strftime("%Y-%m-%d %H:%M PT"), running=False, log=log)
         _write_json(SWEEP_STATUS_FILE, status)
 

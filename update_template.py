@@ -4,14 +4,12 @@ Refresh a schedule file (or the template) from the admin workbook (see schedule_
   - FACILITY column on 'By Day' (inserted before LOCATION if missing) with a dropdown of facility codes
   - facility code table on the 'Lists' sheet (the dropdown's source)
   - conditional formatting that colors the whole row by facility (Facilities sheet, EXCEL COLOR)
-  - ID column = formula <ID PREFIX>-<row number - 1>; the prefix is in Lists!P2 (one prefix per file)
   - Instructions sheet text
-Safe to run again after changing a facility or color.
+Safe to run again after changing a facility or color. Files have no ID column since 2026-11-20 ('By Day' is an
+Excel table; ~/ges_scripts/convert_to_table.ps1 converted the older files).
 
-Usage:  python update_template.py "<admin workbook.xlsx>" ["<file.xlsx>"] [ID PREFIX]
-  file: default the template in the templates folder.  ID PREFIX: default the file's current one (Lists!P2, or the
-  prefix of its first ID). Saved by a script, the IDs have no stored value until Excel opens the file; the
-  app works out the same IDs from the row numbers, so that is fine.
+Usage:  python update_template.py "<admin workbook.xlsx>" ["<file.xlsx>"]
+  file: default the template in the templates folder.
 The file is overwritten; keep a copy first.
 """
 import sys
@@ -101,15 +99,7 @@ FAC_HELP = ("FACILITY - pick the facility code from the dropdown (list is on the
 
 # Instructions lines replaced on every run: {start of the old line: new text}
 INSTRUCTION_TEXT = {
-    "3. ID ":            "3. ID fills in automatically: the file's ID PREFIX (Lists sheet, cell P2) + the row number, "
-                         "e.g. LV-0001. Do not type over it.",
-    "   Changing or deleting an ID": "   Add new shifts at the bottom. Inserting, deleting or sorting rows renumbers the rows "
-                         "below; the app then updates those Outlook events. An empty ID cell is fine - the app works "
-                         "out the same ID from the row number.",
-    "   The prefix (":   "   Each file has its own ID PREFIX. Two files must never use the same prefix "
-                         "(the app holds back rows with duplicate IDs).",
     "   that is how the app knows": "   The time zone comes from the calendar (admin workbook), not from this file.",
-    "ID (required)":     "ID - fills in automatically (formula). Do not type over it.",
     "Name: ":            "Name: <YEAR> GES Electrical Show Schedule <CITY>.xlsx   "
                          "(e.g. 2027 GES Electrical Show Schedule ORL Loews.xlsx)",
     "One file per city": "Save the file in your calendar's folder under ElectricalSchedule (Chicago, Las Vegas, "
@@ -119,7 +109,7 @@ INSTRUCTION_TEXT = {
 }
 
 def _update_instructions(ws):
-    """Document the FACILITY column and the ID formula on the Instructions sheet (text refreshed every run)."""
+    """Document the FACILITY column on the Instructions sheet (text refreshed every run)."""
     if not any(str(c.value or "").startswith(("FACILITY (", "FACILITY - ")) for c in ws["A"]):
         ws["A1"] = str(ws["A1"].value).replace("(v1.0)", "(v1.1)")
         for c in ws["A"]:
@@ -142,33 +132,9 @@ def _update_instructions(ws):
                 c.value = new
                 break
 
-PREFIX_CELL = "P2"                   # Lists!P1 = 'ID PREFIX' header, P2 = this file's prefix
-
-def _set_id_formula(ws, lists, prefix):
-    """ID column: =IF(DATE="","",Lists!$P$2&"-"&TEXT(ROW()-1,"0000")) on every row; Lists!P2 holds the prefix."""
-    lists["P1"] = "ID PREFIX"
-    lists["P1"]._style = copy(lists["C1"]._style)
-    lists[PREFIX_CELL] = prefix
-    lists.column_dimensions["P"].width = 12
-    h = _header(ws)
-    id_col, date_col = h.index("ID") + 1, get_column_letter(h.index("DATE") + 1)
-    for r in range(2, ws.max_row + 1):
-        ws.cell(r, id_col).value = f'=IF({date_col}{r}="","",Lists!$P$2&"-"&TEXT(ROW()-1,"0000"))'
-
-def _current_prefix(ws, lists):
-    if lists[PREFIX_CELL].value:
-        return str(lists[PREFIX_CELL].value).strip()
-    id_col = _header(ws).index("ID") + 1
-    first = next((str(ws.cell(r, id_col).value) for r in range(2, ws.max_row + 1)
-                  if ws.cell(r, id_col).value and not str(ws.cell(r, id_col).value).startswith("=")), "")
-    return first.rsplit("-", 1)[0] if "-" in first else ""
-
-def main(path, prefix=""):
+def main(path):
     wb = load_workbook(path)
     ws = wb["By Day"]
-    prefix = prefix or _current_prefix(ws, wb["Lists"])
-    if not prefix:
-        sys.exit(f"{path}: no ID prefix found; give one, e.g. LV")
     h = _header(ws)
     fac_col = h.index(FAC_HEADER) + 1 if FAC_HEADER in h else _insert_facility_column(ws)
     # Optional column (blank = city calendar), so it looks like LOCATION, not the red required headers
@@ -177,10 +143,9 @@ def main(path, prefix=""):
     _write_lists(wb["Lists"])
     _set_validations(ws, fac_col, last_row)
     _set_row_colors(ws, fac_col, last_row)
-    _set_id_formula(ws, wb["Lists"], prefix)
     _update_instructions(wb["Instructions"])
     wb.save(path)
-    print(f"Updated {path}: FACILITY in column {get_column_letter(fac_col)}, ID prefix {prefix}, rows 2-{last_row}.")
+    print(f"Updated {path}: FACILITY in column {get_column_letter(fac_col)}, rows 2-{last_row}.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -188,4 +153,4 @@ if __name__ == "__main__":
     schedule_config.apply(sys.argv[1])
     for w in schedule_config.CONFIG_WARNINGS:
         print("WARNING:", w)
-    main(sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PATH, sys.argv[3] if len(sys.argv) > 3 else "")
+    main(sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PATH)
